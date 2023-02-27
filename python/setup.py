@@ -222,7 +222,7 @@ setup(
     ],
     package_data={"triton": ["third_party/**/*"]},
     include_package_data=True,
-    ext_modules=[CMakeExtension("triton", "triton/_C/")],
+    # ext_modules=[CMakeExtension("triton", "triton/_C/")],
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
     # for PyPI
