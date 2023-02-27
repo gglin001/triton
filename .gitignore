@@ -15,6 +15,10 @@ __pycache__
 .vscode
 .vs
 
+# llvm
+llvm-project/
+llvm-build/
+
 # JetBrains project files
 .idea
 cmake-build-*
