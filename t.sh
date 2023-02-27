@@ -18,3 +18,12 @@ pip install -e .
 popd
 
 python -c "import triton; print(triton.__version__)"
+
+pip install mypy
+# stubgen -m triton._C.libtriton -o python/
+# stubgen -m triton._C.libtriton.triton -o python/
+# stubgen -m triton._C.libtriton.triton.runtime -m triton._C.libtriton.triton.ir -o python/
+stubgen -m triton._C.libtriton -m triton._C.libtriton.triton -m triton._C.libtriton.triton.runtime -m triton._C.libtriton.triton.ir -o python/
+
+echo "from . import ir" >>python/triton/_C/libtriton/triton/__init__.pyi
+echo "from . import runtime" >>python/triton/_C/libtriton/triton/__init__.pyi

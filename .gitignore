@@ -19,6 +19,9 @@ __pycache__
 llvm-project/
 llvm-build/
 
+# build
+python/triton/_C/libtriton/
+
 # JetBrains project files
 .idea
 cmake-build-*
