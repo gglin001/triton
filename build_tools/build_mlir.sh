@@ -39,7 +39,7 @@ set -x
 cmake -GNinja \
   "-H$LLVM_SRC_DIR/llvm" \
   "-B$build_dir" \
-  -DLLVM_INSTALL_UTILS=ON \
+  -DLLVM_INSTALL_UTILS=OFF \
   -DLLVM_ENABLE_LLD=OFF \
   -DLLVM_ENABLE_PROJECTS=mlir \
   -DLLVM_TARGETS_TO_BUILD="X86;NVPTX;AMDGPU" \
@@ -49,7 +49,7 @@ cmake -GNinja \
   -DLLVM_INCLUDE_TESTS=OFF \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_INSTALL_PREFIX="$build_dir/install" \
-  -DLLVM_ENABLE_ASSERTIONS=On
+  -DLLVM_ENABLE_ASSERTIONS=ON
 
 cmake --build "$build_dir" --target all --target mlir-cpu-runner
 
