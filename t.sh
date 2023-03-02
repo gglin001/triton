@@ -8,6 +8,8 @@ pushd llvm-project && git fetch --depth 1 origin $(cat ../build_tools/llvm_versi
 bash build_tools/build_mlir.sh ${PWD}/llvm-project/ ${PWD}/llvm-build
 
 # apt install libz-dev
+pip install pybind11-global
+mamba install pytorch
 
 # build & install targets with cmake in vscode
 
