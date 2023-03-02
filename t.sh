@@ -7,7 +7,7 @@ pushd llvm-project && git fetch --depth 1 origin $(cat ../build_tools/llvm_versi
 
 bash build_tools/build_mlir.sh ${PWD}/llvm-project/ ${PWD}/llvm-build
 
-apt install libz-dev
+# apt install libz-dev
 
 # build & install targets with cmake in vscode
 
