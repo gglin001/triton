@@ -14,7 +14,7 @@
 
 set -e
 
-if [[ $# -ne 2 ]] ; then
+if [[ $# -ne 2 ]]; then
   echo "Usage: $0 <path/to/llvm> <build_dir>"
   exit 1
 fi
@@ -47,7 +47,7 @@ cmake -GNinja \
   -DLLVM_ENABLE_BINDINGS=OFF \
   -DLLVM_BUILD_TOOLS=OFF \
   -DLLVM_INCLUDE_TESTS=OFF \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$build_dir/install" \
   -DLLVM_ENABLE_ASSERTIONS=ON
 

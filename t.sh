@@ -3,6 +3,7 @@
 
 git clone https://github.com/llvm/llvm-project.git --single-branch -b main --depth=1
 
+# check `python/setup.py` for which llvm commit is used
 pushd llvm-project && git fetch --depth 1 origin $(cat ../build_tools/llvm_version.txt) && popd
 
 bash build_tools/build_mlir.sh ${PWD}/llvm-project/ ${PWD}/llvm-build
