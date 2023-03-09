@@ -41,6 +41,19 @@ endif()
 # Compiler flags
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+include(FetchContent)
+set(FETCHCONTENT_QUIET FALSE)
+FetchContent_Declare(
+  pybind11
+  GIT_REPOSITORY https://github.com/pybind/pybind11
+  GIT_TAG v2.10.0
+  GIT_SHALLOW TRUE)
+if(NOT pybind11_POPULATED)
+  FetchContent_Populate(pybind11)
+  add_subdirectory(${pybind11_SOURCE_DIR}/ ${pybind11_BINARY_DIR}
+                   EXCLUDE_FROM_ALL SYSTEM)
+endif()
+
 # Third-party
 include_directories(${PYBIND11_INCLUDE_DIR})
 
