@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Pass/Pass.h"
@@ -476,14 +477,29 @@ struct TritonReducePattern : public OpConversionPattern<triton::ReduceOp> {
   }
 };
 
-struct TritonPrintfPattern : public OpConversionPattern<triton::PrintfOp> {
-  using OpConversionPattern<PrintfOp>::OpConversionPattern;
+struct TritonPrintPattern : public OpConversionPattern<triton::PrintOp> {
+  using OpConversionPattern<triton::PrintOp>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(PrintfOp op, typename PrintfOp::Adaptor adaptor,
+  matchAndRewrite(triton::PrintOp op, typename triton::PrintOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::PrintfOp>(
+    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::PrintOp>(
                       op, op.getPrefixAttr(), adaptor.getOperands()),
+                  adaptor.getAttributes());
+    return success();
+  }
+};
+
+struct TritonAssertPattern : public OpConversionPattern<triton::AssertOp> {
+  using OpConversionPattern<triton::AssertOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::AssertOp op,
+                  typename triton::AssertOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    addNamedAttrs(rewriter.replaceOpWithNewOp<triton::AssertOp>(
+                      op, adaptor.getCondition(), op.getMessageAttr(),
+                      op.getFileAttr(), op.getFuncAttr(), op.getLineAttr()),
                   adaptor.getAttributes());
     return success();
   }
@@ -503,8 +519,8 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
           TritonGenericPattern<triton::AddPtrOp>, TritonCatPattern,
           TritonReducePattern, TritonTransPattern, TritonExpandDimsPattern,
           TritonMakeRangePattern, TritonDotPattern, TritonLoadPattern,
-          TritonStorePattern, TritonExtElemwisePattern, TritonPrintfPattern,
-          TritonAtomicRMWPattern>(typeConverter, context);
+          TritonStorePattern, TritonExtElemwisePattern, TritonPrintPattern,
+          TritonAssertPattern, TritonAtomicRMWPattern>(typeConverter, context);
 }
 
 //
@@ -670,9 +686,12 @@ public:
   LogicalResult
   matchAndRewrite(cf::BranchOp op, cf::BranchOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    addNamedAttrs(rewriter.replaceOpWithNewOp<cf::BranchOp>(
-                      op, op.getSuccessor(), adaptor.getOperands()),
-                  adaptor.getAttributes());
+    auto converter = getTypeConverter();
+    auto newOp = rewriter.replaceOpWithNewOp<cf::BranchOp>(
+        op, op.getSuccessor(), adaptor.getOperands());
+    if (failed(rewriter.convertRegionTypes(newOp.getSuccessor()->getParent(),
+                                           *converter)))
+      return failure();
     return success();
   }
 };
@@ -697,6 +716,27 @@ public:
     if (failed(rewriter.convertRegionTypes(newOp.getFalseDest()->getParent(),
                                            *converter)))
       return failure();
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class FuncOpPattern : public OpConversionPattern<func::FuncOp> {
+public:
+  using OpConversionPattern<func::FuncOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::FuncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto converter = getTypeConverter();
+    auto newOp = rewriter.replaceOpWithNewOp<func::FuncOp>(
+        op, op.getName(), op.getFunctionType());
+    addNamedAttrs(newOp, adaptor.getAttributes());
+    rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
+                                newOp.getBody().end());
+    if (failed(rewriter.convertRegionTypes(&newOp.getBody(), *converter)))
+      return failure();
+
     return success();
   }
 };
@@ -704,7 +744,8 @@ public:
 void populateCFPatterns(TritonGPUTypeConverter &typeConverter,
                         RewritePatternSet &patterns) {
   MLIRContext *context = patterns.getContext();
-  patterns.add<CFBranchPattern, CFCondBranchPattern>(typeConverter, context);
+  patterns.add<FuncOpPattern, CFCondBranchPattern, CFBranchPattern>(
+      typeConverter, context);
 }
 //
 

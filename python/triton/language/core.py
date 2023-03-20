@@ -37,10 +37,9 @@ def _to_tensor(x, builder):
 
 
 class dtype:
-    SINT_TYPES = ['int1', 'int8', 'int16', 'int32', 'int64']
-    UINT_TYPES = ['uint8', 'uint16', 'uint32', 'uint64']
-    FP_TYPES = ['fp8', 'fp16', 'bf16', 'fp32', 'fp64']
-    CUSTOMIZED_FP_TYPES = ['fp8']
+    SINT_TYPES = ['int8', 'int16', 'int32', 'int64']
+    UINT_TYPES = ['int1', 'uint8', 'uint16', 'uint32', 'uint64']
+    FP_TYPES = ['fp8e4', 'fp8e5', 'fp16', 'bf16', 'fp32', 'fp64']
     STANDARD_FP_TYPES = ['fp16', 'bf16', 'fp32', 'fp64']
     OTHER_TYPES = ['void']
 
@@ -60,8 +59,11 @@ class dtype:
             self.int_bitwidth = int(name.split('int')[-1])
             self.primitive_bitwidth = self.int_bitwidth
         elif name in dtype.FP_TYPES:
-            if name == 'fp8':
+            if name == 'fp8e4':
                 self.fp_mantissa_width = 3
+                self.primitive_bitwidth = 8
+            elif name == 'fp8e5':
+                self.fp_mantissa_width = 2
                 self.primitive_bitwidth = 8
             elif name == 'fp16':
                 self.fp_mantissa_width = 10
@@ -75,11 +77,13 @@ class dtype:
             elif name == 'fp64':
                 self.fp_mantissa_width = 53
                 self.primitive_bitwidth = 64
+            else:
+                raise RuntimeError(f'Unsupported floating-point type {name}')
         elif name == 'void':
             self.primitive_bitwidth = 0
 
     def is_fp8(self):
-        return self.name == 'fp8'
+        return 'fp8' in self.name
 
     def is_fp16(self):
         return self.name == 'fp16'
@@ -122,9 +126,6 @@ class dtype:
 
     def is_floating(self):
         return self.name in dtype.FP_TYPES
-
-    def is_customized_floating(self):
-        return self.name in dtype.CUSTOMIZED_FP_TYPES
 
     def is_standard_floating(self):
         return self.name in dtype.STANDARD_FP_TYPES
@@ -181,8 +182,10 @@ class dtype:
             return builder.get_int32_ty()
         elif self.name in ('int64', 'uint64'):
             return builder.get_int64_ty()
-        elif self.name == 'fp8':
-            return builder.get_fp8_ty()
+        elif self.name == 'fp8e5':
+            return builder.get_fp8e5_ty()
+        elif self.name == 'fp8e4':
+            return builder.get_fp8e4_ty()
         elif self.name == 'fp16':
             return builder.get_half_ty()
         elif self.name == 'bf16':
@@ -314,7 +317,8 @@ uint8 = dtype('uint8')
 uint16 = dtype('uint16')
 uint32 = dtype('uint32')
 uint64 = dtype('uint64')
-float8 = dtype('fp8')
+float8e5 = dtype('fp8e5')
+float8e4 = dtype('fp8e4')
 float16 = dtype('fp16')
 bfloat16 = dtype('bf16')
 float32 = dtype('fp32')
@@ -858,7 +862,7 @@ def reshape(input, shape, _builder=None):
 
 
 @builtin
-def dot(input, other, allow_tf32=True, _builder=None):
+def dot(input, other, allow_tf32=True, out_dtype=float32, _builder=None):
     """
     Returns the matrix product of two blocks.
 
@@ -870,7 +874,8 @@ def dot(input, other, allow_tf32=True, _builder=None):
     :type other: 2D tensor of scalar-type in {:code:`float16`, :code:`bfloat16`, :code:`float32`}
     """
     allow_tf32 = _constexpr_to_value(allow_tf32)
-    return semantic.dot(input, other, allow_tf32, _builder)
+    out_dtype = _constexpr_to_value(out_dtype)
+    return semantic.dot(input, other, allow_tf32, out_dtype, _builder)
 
 
 # -----------------------
@@ -894,7 +899,7 @@ def load(pointer, mask=None, other=None, cache_modifier="", eviction_policy="", 
     :param other: if mask[idx] is false, return other[idx]
     :type other: Block, optional
     :param cache_modifier: changes cache option in nvidia ptx
-    'type cache_modifier: str, optional
+    :type cache_modifier: str, optional
     """
     # mask, other can be constexpr
     if _constexpr_to_value(mask) is not None:
@@ -1027,7 +1032,7 @@ def where(condition, x, y, _builder=None):
     If you want to avoid unintended memory operations, use the :code:`mask` arguments in `triton.load` and `triton.store` instead.
 
     The shape of :code:`x` and :code:`y` are both broadcast to the shape of :code:`condition`.
-    :code:`x` and :code:`y` must have the data type.
+    :code:`x` and :code:`y` must have the same data type.
 
     :param condition: When True (nonzero), yield x, otherwise yield y.
     :type condition: Block of triton.bool
@@ -1061,7 +1066,7 @@ def _add_math_1arg_docstr(name: str) -> Callable[[T], T]:
 
     def _decorator(func: T) -> T:
         docstr = """
-    Computes the element-wise {name} of :code:`x`
+    Computes the element-wise {name} of :code:`x`.
 
     :param x: the input values
     :type x: Block
@@ -1211,7 +1216,16 @@ def max_contiguous(input, values, _builder=None):
 
 @triton.jit
 def abs(x):
-    return where(x >= 0, x, -x)
+    x_dtype = x.dtype
+    if x_dtype.is_floating():
+        num_bits: constexpr = x.dtype.primitive_bitwidth
+        int_dtype = dtype(f'int{num_bits}')
+        mask = 2 ** (num_bits - 1) - 1
+        ret = x.to(int_dtype, bitcast=True) & mask.to(int_dtype)
+        ret = ret.to(x_dtype, bitcast=True)
+    else:
+        ret = where(x >= 0, x, -x)
+    return ret
 
 
 @triton.jit
@@ -1271,7 +1285,7 @@ def softmax(x, ieee_rounding=False):
 @triton.jit
 def ravel(x):
     """
-    Returns a contiguous flattened view of :code:`x`
+    Returns a contiguous flattened view of :code:`x`.
 
     :param x: the input tensor
     :type x: Block
@@ -1329,24 +1343,56 @@ def zeros(shape, dtype):
 def zeros_like(input):
     return zeros(input.shape, input.dtype)
 
+# -----------------------
+# Debugging functions
+# -----------------------
+
 
 @builtin
-def printf(prefix, *args, _builder=None):
+def static_print(*values, sep: str = " ", end: str = "\n", file=None, flush=False, _builder=None):
+    pass
+
+
+@builtin
+def static_assert(cond, msg="", _builder=None):
+    pass
+
+
+@builtin
+def device_print(prefix, *args, _builder=None):
     import string
-    new_prefix = prefix
-    if isinstance(prefix, constexpr):
-        new_prefix = prefix.value
-    assert isinstance(new_prefix, str), f"{new_prefix} is not string"
+    prefix = _constexpr_to_value(prefix)
+    assert isinstance(prefix, str), f"{prefix} is not string"
     b_ascii = True
-    for ch in new_prefix:
+    for ch in prefix:
         if ch not in string.printable:
             b_ascii = False
             break
-    assert b_ascii, f"{new_prefix} is not an ascii string"
+    assert b_ascii, f"{prefix} is not an ascii string"
     new_args = []
     for arg in args:
         new_args.append(_to_tensor(arg, _builder))
-    return semantic.printf(new_prefix, new_args, _builder)
+    return semantic.device_print(prefix, new_args, _builder)
+
+
+@builtin
+def device_assert(cond, msg="", _builder=None):
+    msg = _constexpr_to_value(msg)
+    import inspect
+    frame = inspect.currentframe()
+    module = inspect.getmodule(frame)
+    # The triton function module doesn't have the name attribute.
+    # We use this trick to find the caller.
+    while hasattr(module, "__name__"):
+        frame = frame.f_back
+        module = inspect.getmodule(frame)
+    func_name = frame.f_code.co_name
+    file_name = frame.f_back.f_code.co_filename
+    # TODO: The line number currently indicates the line
+    # where the triton function is called but not where the
+    # device_assert is called. Need to enhance this.
+    lineno = frame.f_back.f_lineno
+    return semantic.device_assert(_to_tensor(cond, _builder), msg, file_name, func_name, lineno, _builder)
 
 # -----------------------
 # Iterators

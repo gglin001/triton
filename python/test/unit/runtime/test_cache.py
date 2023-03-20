@@ -148,6 +148,26 @@ def test_jit_warmup_cache() -> None:
     assert len(kernel_add.cache) == 1
 
 
+def test_jit_debug() -> None:
+    @triton.jit
+    def kernel_add(a, b, o, N: tl.constexpr):
+        idx = tl.arange(0, N)
+        tl.device_assert(idx < 32, "idx < 32")
+        tl.store(o + idx,
+                 tl.load(a + idx) + tl.load(b + idx))
+
+    device = torch.cuda.current_device()
+    assert len(kernel_add.cache[device]) == 0
+    kernel_add.warmup(torch.float32, torch.float32, torch.float32, 32, grid=(1,))
+    assert len(kernel_add.cache[device]) == 1
+    kernel_add.debug = False
+    kernel_add.warmup(torch.float32, torch.float32, torch.float32, 32, grid=(1,))
+    assert len(kernel_add.cache[device]) == 1
+    kernel_add.debug = True
+    kernel_add.warmup(torch.float32, torch.float32, torch.float32, 32, grid=(1,))
+    assert len(kernel_add.cache[device]) == 2
+
+
 def test_compile_in_subproc() -> None:
     @triton.jit
     def kernel_sub(a, b, o, N: tl.constexpr):
@@ -176,3 +196,15 @@ def test_compile_in_subproc() -> None:
     proc.start()
     proc.join()
     assert proc.exitcode == 0
+
+
+def test_memory_leak() -> None:
+    @triton.jit
+    def kernel(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr):
+        xnumel = 10
+        xoffset = tl.program_id(0) * XBLOCK
+        xindex = xoffset + tl.arange(0, XBLOCK)[:]
+        xmask = xindex < xnumel
+        x0 = xindex
+        tmp0 = tl.load(in_ptr0 + (x0), xmask)
+        tl.store(out_ptr0 + (x0 + tl.zeros([XBLOCK], tl.int32)), tmp0, xmask)

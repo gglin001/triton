@@ -25,6 +25,8 @@
 
 #include "Utility.h"
 
+class TritonGPUToLLVMTypeConverter;
+
 namespace mlir {
 namespace LLVM {
 using namespace mlir::triton;
@@ -44,45 +46,6 @@ struct DotOpMmaV1ConversionHelper {
   explicit DotOpMmaV1ConversionHelper(MmaEncodingAttr mmaLayout)
       : mmaLayout(mmaLayout), wpt(mmaLayout.getWarpsPerCTA()) {}
 
-  // Help to share some variables across multiple functions for A.
-  // TODO[Superjomn]: refactor and restrict this to only use in DotOp
-  // conversion.
-  struct AParam {
-    SmallVector<int> rep;
-    SmallVector<int> spw;
-    bool isAVec4{};
-    int vec{}; // This could only used in DotOp, not in
-               // loadA/loadB/TypeConverter
-
-    AParam(bool isARow, bool isAVec4) : isAVec4(isAVec4) { build(isARow); }
-
-  private:
-    void build(bool isARow);
-  };
-
-  // Help to share some variables across multiple functions for A.
-  // TODO[Superjomn]: refactor and restrict this to only use in DotOp
-  // conversion.
-  struct BParam {
-    SmallVector<int> rep;
-    SmallVector<int> spw;
-    bool isBVec4{};
-    int vec{}; // This could only used in DotOp, not in
-               // loadA/loadB/TypeConverter
-
-    BParam(bool isBRow, bool isBVec4) : isBVec4(isBVec4) { build(isBRow); }
-
-  private:
-    void build(bool isBRow);
-  };
-
-  int getRepM(int M) const {
-    return std::max<int>(M / (wpt[0] * instrShape[0]), 1);
-  }
-  int getRepN(int N) const {
-    return std::max<int>(N / (wpt[1] * instrShape[1]), 1);
-  }
-
   static ArrayRef<unsigned> getMmaInstrShape() { return instrShape; }
 
   static Type getMmaRetType(TensorType operand) {
@@ -99,35 +62,15 @@ struct DotOpMmaV1ConversionHelper {
     return struct_ty(SmallVector<Type>{vecTy});
   }
 
-  // Get the number of fp16x2 elements for $a.
-  unsigned getNumM(int M, bool isARow, bool isAVec4) const {
-    AParam param(isARow, isAVec4);
-
-    unsigned numM = param.rep[0] * M / (param.spw[0] * wpt[0]);
-    return numM;
-  }
-
-  // Get the number of fp16x2 elements for $b.
-  unsigned getNumN(int N, bool isBRow, bool isBVec4) const {
-    BParam param(isBRow, isBVec4);
-
-    unsigned numN = param.rep[1] * N / (param.spw[1] * wpt[1]);
-    return numN;
-  }
-
-  int numElemsPerThreadA(ArrayRef<int64_t> shape, bool isARow, bool isAVec4,
-                         int vec) const;
-
-  int numElemsPerThreadB(ArrayRef<int64_t> shape, bool isBRow, bool isBVec4,
-                         int vec) const;
-
   // Loading $a from smem to registers, returns a LLVM::Struct.
   Value loadA(Value tensor, const SharedMemoryObject &smemObj, Value thread,
-              Location loc, ConversionPatternRewriter &rewriter) const;
+              Location loc, TritonGPUToLLVMTypeConverter *converter,
+              ConversionPatternRewriter &rewriter, Type resultTy) const;
 
   // Loading $b from smem to registers, returns a LLVM::Struct.
   Value loadB(Value tensor, const SharedMemoryObject &smemObj, Value thread,
-              Location loc, ConversionPatternRewriter &rewriter) const;
+              Location loc, TritonGPUToLLVMTypeConverter *converter,
+              ConversionPatternRewriter &rewriter, Type resultTy) const;
 
   static ArrayRef<unsigned> getOrder() { return mmaOrder; }
 
@@ -144,25 +87,17 @@ struct DotOpMmaV1ConversionHelper {
                  ConversionPatternRewriter &rewriter, Location loc) const;
 
   // Extract values belong to $a or $b from a LLVMStruct, the shape is n0xn1.
-  DotOpMmaV1ConversionHelper::ValueTable
-  extractLoadedOperand(Value llStruct, int NK,
-                       ConversionPatternRewriter &rewriter) const;
-
-  // Get the number of elements of this thread in M axis. The N axis could be
-  // further deduced with the accSize / elemsM. \param wpt: the wpt in M axis
-  // \param M: the shape in M axis
-  int getElemsM(int wpt, int M, bool isARow, bool isAVec4) {
-    DotOpMmaV1ConversionHelper::AParam param(isARow, isAVec4);
-    int shapePerCTAM = param.spw[0] * wpt;
-    return M / shapePerCTAM * param.rep[0];
-  }
+  DotOpMmaV1ConversionHelper::ValueTable extractLoadedOperand(
+      Value llStruct, int NK, ConversionPatternRewriter &rewriter,
+      TritonGPUToLLVMTypeConverter *typeConverter, Type type) const;
 
   using CoordTy = SmallVector<Value>;
   // Get the coordinates(m,n) of the elements emit by a thread in accumulator.
   static SmallVector<CoordTy>
   getMNCoords(Value thread, ConversionPatternRewriter &rewriter,
-              ArrayRef<unsigned> wpt, ArrayRef<int64_t> shape, bool isARow,
-              bool isBRow, bool isAVec4, bool isBVec4);
+              ArrayRef<unsigned> wpt, const MmaEncodingAttr &mmaLayout,
+              ArrayRef<int64_t> shape, bool isARow, bool isBRow, bool isAVec4,
+              bool isBVec4);
 
   // \param elemId the offset of the element in a thread
   static CoordTy getCoord(int elemId, ArrayRef<CoordTy> coords) {
@@ -181,6 +116,7 @@ struct DotOpMmaV2ConversionHelper {
     FP32_FP16_FP16_FP32 = 0, // default
     FP32_BF16_BF16_FP32,
     FP32_TF32_TF32_FP32,
+    FP16_FP16_FP16_FP16,
     // integer tensor core instr
     INT32_INT1_INT1_INT32, // Not implemented
     INT32_INT4_INT4_INT32, // Not implemented
@@ -220,6 +156,8 @@ struct DotOpMmaV2ConversionHelper {
 
   Type getMmaRetType() const;
 
+  int getMmaRetSize() const;
+
   ArrayRef<int> getMmaInstrShape() const {
     assert(mmaType != TensorCoreType::NOT_APPLICABLE &&
            "Unknown mma type found.");
@@ -239,6 +177,9 @@ struct DotOpMmaV2ConversionHelper {
   }
 
   // Deduce the TensorCoreType from either $a or $b's type.
+  // TODO: both the input type ($a or $b) and output type ($c or $d) are
+  // needed to differentiate TensorCoreType::FP32_FP16_FP16_FP32 from
+  // TensorCoreType::FP16_FP16_FP16_FP16
   static TensorCoreType getTensorCoreTypeFromOperand(Type operandTy);
 
   int getVec() const {
@@ -267,6 +208,7 @@ private:
           {TensorCoreType::FP32_FP16_FP16_FP32, {16, 8, 16}},
           {TensorCoreType::FP32_BF16_BF16_FP32, {16, 8, 16}},
           {TensorCoreType::FP32_TF32_TF32_FP32, {16, 8, 8}},
+          {TensorCoreType::FP16_FP16_FP16_FP16, {16, 8, 16}},
 
           {TensorCoreType::INT32_INT1_INT1_INT32, {16, 8, 256}},
           {TensorCoreType::INT32_INT4_INT4_INT32, {16, 8, 64}},
@@ -282,6 +224,7 @@ private:
           {TensorCoreType::FP32_FP16_FP16_FP32, {8, 8, 8}},
           {TensorCoreType::FP32_BF16_BF16_FP32, {8, 8, 8}},
           {TensorCoreType::FP32_TF32_TF32_FP32, {8, 8, 4}},
+          {TensorCoreType::FP16_FP16_FP16_FP16, {8, 8, 8}},
 
           {TensorCoreType::INT32_INT1_INT1_INT32, {8, 8, 64}},
           {TensorCoreType::INT32_INT4_INT4_INT32, {8, 8, 32}},
@@ -299,6 +242,8 @@ private:
        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"},
       {TensorCoreType::FP32_TF32_TF32_FP32,
        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32"},
+      {TensorCoreType::FP16_FP16_FP16_FP16,
+       "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16"},
 
       {TensorCoreType::INT32_INT1_INT1_INT32,
        "mma.sync.aligned.m16n8k256.row.col.s32.b1.b1.s32.xor.popc"},
@@ -313,6 +258,7 @@ private:
       {TensorCoreType::FP32_FP16_FP16_FP32, 8},
       {TensorCoreType::FP32_BF16_BF16_FP32, 8},
       {TensorCoreType::FP32_TF32_TF32_FP32, 4},
+      {TensorCoreType::FP16_FP16_FP16_FP16, 8},
 
       {TensorCoreType::INT32_INT1_INT1_INT32, 128},
       {TensorCoreType::INT32_INT4_INT4_INT32, 32},
@@ -397,7 +343,7 @@ private:
 };
 
 // This class helps to adapt the existing DotOpConversion to the latest
-// DotOpOperand layout design. It decouples the exising implementation to two
+// DotOpOperand layout design. It decouples the existing implementation to two
 // parts:
 // 1. loading the specific operand matrix(for $a, $b, $c) from smem
 // 2. passing the loaded value and perform the mma codegen
@@ -410,7 +356,7 @@ struct MMA16816ConversionHelper {
 
   DotOpMmaV2ConversionHelper helper;
   ConversionPatternRewriter &rewriter;
-  TypeConverter *typeConverter;
+  TritonGPUToLLVMTypeConverter *typeConverter;
   Location loc;
   MLIRContext *ctx{};
 
@@ -419,11 +365,26 @@ struct MMA16816ConversionHelper {
   // dotOperand: type of either one operand of dotOp.
   MMA16816ConversionHelper(Type dotOperand, MmaEncodingAttr mmaLayout,
                            Value thread, ConversionPatternRewriter &rewriter,
-                           TypeConverter *typeConverter, Location loc)
+                           TritonGPUToLLVMTypeConverter *typeConverter,
+                           Location loc)
       : mmaLayout(mmaLayout), wpt(mmaLayout.getWarpsPerCTA()), thread(thread),
         helper(mmaLayout), rewriter(rewriter), typeConverter(typeConverter),
         loc(loc), ctx(mmaLayout.getContext()) {
     helper.deduceMmaType(dotOperand);
+
+    Value _32 = i32_val(32);
+    lane = urem(thread, _32);
+    warp = udiv(thread, _32);
+  }
+
+  MMA16816ConversionHelper(DotOp op, MmaEncodingAttr mmaLayout, Value thread,
+                           ConversionPatternRewriter &rewriter,
+                           TritonGPUToLLVMTypeConverter *typeConverter,
+                           Location loc)
+      : mmaLayout(mmaLayout), wpt(mmaLayout.getWarpsPerCTA()), thread(thread),
+        helper(mmaLayout), rewriter(rewriter), typeConverter(typeConverter),
+        loc(loc), ctx(mmaLayout.getContext()) {
+    helper.deduceMmaType(op);
 
     Value _32 = i32_val(32);
     lane = urem(thread, _32);
@@ -560,8 +521,8 @@ private:
   Value composeValuesToDotOperandLayoutStruct(const ValueTable &vals, int n0,
                                               int n1) const;
 
-  ValueTable getValuesFromDotOperandLayoutStruct(Value value, int n0,
-                                                 int n1) const;
+  ValueTable getValuesFromDotOperandLayoutStruct(Value value, int n0, int n1,
+                                                 Type type) const;
 };
 
 // Helper for conversion of FMA DotOp.
@@ -580,19 +541,23 @@ struct DotOpFMAConversionHelper {
                ConversionPatternRewriter &rewriter, Location loc) const;
 
   Value loadA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
-              Location loc, ConversionPatternRewriter &rewriter) const;
+              Location loc, TritonGPUToLLVMTypeConverter *typeConverter,
+              ConversionPatternRewriter &rewriter) const;
 
   Value loadB(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
-              Location loc, ConversionPatternRewriter &rewriter) const;
+              Location loc, TritonGPUToLLVMTypeConverter *typeConverter,
+              ConversionPatternRewriter &rewriter) const;
 
-  ValueTable getValueTableFromStruct(Value val, int K, int n0, int shapePerCTA,
-                                     int sizePerThread,
-                                     ConversionPatternRewriter &rewriter,
-                                     Location loc) const;
+  ValueTable getValueTableFromStruct(
+      Value val, int K, int n0, int shapePerCTA, int sizePerThread,
+      ConversionPatternRewriter &rewriter, Location loc,
+      TritonGPUToLLVMTypeConverter *typeConverter, Type type) const;
 
   Value getStructFromValueTable(ArrayRef<Value> vals,
                                 ConversionPatternRewriter &rewriter,
-                                Location loc, Type elemTy) const;
+                                Location loc,
+                                TritonGPUToLLVMTypeConverter *typeConverter,
+                                Type elemTy) const;
 
   // get number of elements per thread for $a or $b.
   static int getNumElemsPerThread(ArrayRef<int64_t> shape,
