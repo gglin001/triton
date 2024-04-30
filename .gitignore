@@ -66,3 +66,5 @@ docs/sg_execution_times.rst
 *.swp
 
 CMakeUserPresets.json
+python/triton/_C/libtriton.pyi
+python/triton/_C/libtriton/
