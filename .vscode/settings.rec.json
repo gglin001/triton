@@ -1,11 +1,11 @@
 {
-    "cmake.configureSettings": {
-        "CMAKE_PREFIX_PATH": "/opt/conda/envs/pyenv",
-        "CMAKE_INSTALL_PREFIX": "install",
-        "Python3_EXECUTABLE": "/opt/conda/envs/pyenv/bin/python",
-        "LLVM_LIBRARY_DIR": "${workspaceFolder}/llvm-build/install/lib/cmake",
-        "MLIR_DIR": "${workspaceFolder}/llvm-build/install/lib/cmake",
-        // "llvm_DIR": "${workspaceFolder}/llvm-build/install/lib",
-        "TRITON_BUILD_PYTHON_MODULE": "ON",
+    "terminal.integrated.env.linux": {
+        "EXT_PATH": "${workspaceFolder}/build/bin",
     },
+    "terminal.integrated.env.osx": {
+        "EXT_PATH": "${workspaceFolder}/build/bin",
+    },
+    "cmake.useCMakePresets": "always",
+    // use abs path
+    // "mlir.server_path": "${workspaceFolder}/build/bin/triton-lsp",
 }

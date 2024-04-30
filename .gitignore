@@ -64,3 +64,5 @@ docs/sg_execution_times.rst
 
 # Vim
 *.swp
+
+CMakeUserPresets.json
