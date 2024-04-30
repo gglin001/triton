@@ -3,6 +3,7 @@
 ###############################################################################
 
 # "TRITON_BUILD_PYTHON_MODULE": true,
+rm $PWD/python/triton/_C/libtriton.so
 # cp build/libtriton.so python/triton/_C/
 ln -sf $PWD/build/libtriton.so $PWD/python/triton/_C/
 
