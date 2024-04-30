@@ -12,6 +12,7 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
         "CMAKE_C_COMPILER": "/usr/bin/clang",
         "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
+        "CMAKE_INSTALL_RPATH_USE_LINK_PATH": true,
         "LLVM_DIR": "/iree-llvm-project/build/install/lib/cmake/llvm",
         "MLIR_DIR": "/iree-llvm-project/build/install/lib/cmake/mlir",
         "LLVM_LIBRARY_DIR": "/iree-llvm-project/build/install/lib/cmake/llvm",
