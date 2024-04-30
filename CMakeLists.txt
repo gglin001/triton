@@ -207,10 +207,10 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
     # LLVM
     LLVMPasses
-    LLVMNVPTXCodeGen
-    # LLVMNVPTXAsmPrinter
-    LLVMAMDGPUCodeGen
-    LLVMAMDGPUAsmParser
+    # LLVMNVPTXCodeGen
+    # # LLVMNVPTXAsmPrinter
+    # LLVMAMDGPUCodeGen
+    # LLVMAMDGPUAsmParser
 
     LLVMRISCVCodeGen
     LLVMRISCVAsmParser
