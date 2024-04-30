@@ -20,6 +20,7 @@
         "TRITON_BUILD_PROTON": false,
         "TRITON_BUILD_UT": false,
         "TRITON_CODEGEN_BACKENDS": "nvidia;amd",
+        "LLVM_ENABLE_ASSERTIONS": true,
         "UNUSED": "UNUSED"
       }
     }
