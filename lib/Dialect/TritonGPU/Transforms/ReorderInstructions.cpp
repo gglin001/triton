@@ -1,6 +1,7 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
@@ -16,20 +17,19 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #define GEN_PASS_CLASSES
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
 using namespace mlir;
 
-static inline bool
-willIncreaseRegisterPressure(triton::gpu::ConvertLayoutOp op) {
-  auto srcType = op.getOperand().getType().cast<RankedTensorType>();
-  auto dstType = op.getResult().getType().cast<RankedTensorType>();
-  auto srcEncoding = srcType.getEncoding();
-  auto dstEncoding = dstType.getEncoding();
-  if (srcEncoding.isa<triton::gpu::SharedEncodingAttr>())
+static bool willIncreaseRegisterPressure(Operation *op) {
+  if (isa<triton::gpu::LocalLoadOp>(op))
     return true;
-  if (dstEncoding.isa<triton::gpu::DotOperandEncodingAttr>())
+  auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(op);
+  if (!cvt)
+    return false;
+  if (cvt.getType().getEncoding().isa<triton::gpu::DotOperandEncodingAttr>())
     return true;
   return false;
 }
@@ -40,12 +40,37 @@ class TritonGPUReorderInstructionsPass
 public:
   TritonGPUReorderInstructionsPass() = default;
 
+  Operation *getFirstUse(Operation *op) {
+    std::vector<Operation *> users;
+    for (auto user : op->getUsers()) {
+      if (Operation *ancestor = op->getBlock()->findAncestorOpInBlock(*user))
+        users.push_back(ancestor);
+    }
+    auto minOpIt = std::min_element(users.begin(), users.end(),
+                                    [](mlir::Operation *a, mlir::Operation *b) {
+                                      return a->isBeforeInBlock(b);
+                                    });
+    return minOpIt != users.end() ? *minOpIt : nullptr;
+  }
+
   void runOnOperation() override {
     ModuleOp m = getOperation();
+    mlir::DominanceInfo dom(m);
+    // sink conversion after the last dealloc
+    // before the first use ancestor in its block
+    m.walk([&](triton::gpu::ConvertLayoutOp op) {
+      auto curr = mlir::Block::iterator(op);
+      for (; &*curr != getFirstUse(op); curr++)
+        if (isa<triton::gpu::LocalDeallocOp>(&*curr))
+          op->moveAfter(&*curr);
+    });
     // Sink conversions into loops when they will increase
     // register pressure
     DenseMap<Operation *, Operation *> opToMove;
-    m.walk([&](triton::gpu::ConvertLayoutOp op) {
+    auto moveAfter = [](Operation *lhs, Operation *rhs) {
+      lhs->moveAfter(rhs);
+    };
+    m.walk([&](Operation *op) {
       if (!willIncreaseRegisterPressure(op))
         return;
       auto user_begin = op->user_begin();
@@ -59,50 +84,53 @@ public:
     });
     for (auto &kv : opToMove)
       kv.first->moveBefore(kv.second);
-    // Move convert(load) immediately after dependent load
-    m.walk([&](triton::gpu::ConvertLayoutOp op) {
-      auto dstType = op.getResult().getType().cast<RankedTensorType>();
-      auto dstEncoding = dstType.getEncoding();
-      if (!dstEncoding.isa<triton::gpu::SharedEncodingAttr>())
+    // Move alloc(load) immediately after dependent load
+    m.walk([&](triton::gpu::LocalAllocOp op) {
+      if (!op.getSrc())
         return;
-      Operation *argOp = op.getOperand().getDefiningOp();
+      Operation *argOp = op.getSrc().getDefiningOp();
       if (!argOp)
         return;
-      op->moveAfter(argOp);
+      moveAfter(op, argOp);
     });
     // Move transpositions just after their definition
     opToMove.clear();
     m.walk([&](triton::TransOp op) {
-      Operation *argOp = op.getOperand().getDefiningOp();
+      Operation *argOp = op.getSrc().getDefiningOp();
       if (!argOp)
         return;
-      op->moveAfter(argOp);
+      moveAfter(op, argOp);
     });
-    // Move `dot` operand so that conversions to opIdx=0 happens before
-    // conversions to opIdx=1
-    m.walk([&](triton::gpu::ConvertLayoutOp op) {
-      auto dstType = op.getResult().getType().cast<RankedTensorType>();
-      auto dstEncoding =
-          dstType.getEncoding().dyn_cast<triton::gpu::DotOperandEncodingAttr>();
+    // Move `dot` operand so that conversions to opIdx=1 happens after
+    // conversions to opIdx=0
+    m.walk([&](triton::gpu::LocalLoadOp op) {
+      auto dstEncoding = op.getType()
+                             .getEncoding()
+                             .dyn_cast<triton::gpu::DotOperandEncodingAttr>();
       if (!dstEncoding)
         return;
       int opIdx = dstEncoding.getOpIdx();
-      if (opIdx != 0)
+      if (opIdx != 1)
         return;
-      if (op->getUsers().empty())
+      if (!op->hasOneUse())
         return;
       auto dotUser = dyn_cast<triton::DotOp>(*op->user_begin());
       if (!dotUser)
         return;
-      auto BOp = dotUser.getOperand(1).getDefiningOp();
-      if (!BOp)
+      auto AOp =
+          dotUser.getOperand(0).getDefiningOp<triton::gpu::LocalLoadOp>();
+      if (!AOp)
         return;
-      op->moveBefore(BOp);
+      // Check that the conversion to OpIdx=1 happens before and can be moved
+      // after the conversion to OpIdx=0.
+      if (!dom.dominates(op.getOperation(), AOp.getOperation()))
+        return;
+      moveAfter(op, AOp);
     });
     return;
   }
 };
 
-std::unique_ptr<Pass> mlir::createTritonGPUReorderInstructionsPass() {
+std::unique_ptr<Pass> mlir::triton::gpu::createReorderInstructionsPass() {
   return std::make_unique<TritonGPUReorderInstructionsPass>();
 }

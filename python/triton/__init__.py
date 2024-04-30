@@ -1,34 +1,29 @@
 """isort:skip_file"""
-__version__ = '2.1.0'
+__version__ = '3.0.0'
 
 # ---------------------------------------
 # Note: import order is significant here.
 
-# TODO: torch needs to be imported first
-# or pybind11 shows `munmap_chunk(): invalid pointer`
-import torch  # noqa: F401
-
 # submodules
-from . import impl
-from .utils import (
-    cdiv,
-    MockTensor,
-    next_power_of_2,
-    reinterpret,
-    TensorWrapper,
-)
 from .runtime import (
     autotune,
     Config,
     heuristics,
     JITFunction,
     KernelInterface,
+    reinterpret,
+    TensorWrapper,
+    OutOfResources,
+    InterpreterError,
+    MockTensor,
 )
 from .runtime.jit import jit
 from .compiler import compile, CompilationError
+from .errors import TritonError
+
 from . import language
 from . import testing
-from . import ops
+from . import tools
 
 __all__ = [
     "autotune",
@@ -38,6 +33,7 @@ __all__ = [
     "Config",
     "heuristics",
     "impl",
+    "InterpreterError",
     "jit",
     "JITFunction",
     "KernelInterface",
@@ -45,8 +41,33 @@ __all__ = [
     "MockTensor",
     "next_power_of_2",
     "ops",
+    "OutOfResources",
     "reinterpret",
     "runtime",
     "TensorWrapper",
+    "TritonError",
     "testing",
+    "tools",
 ]
+
+# -------------------------------------
+# misc. utilities that  don't fit well
+# into any specific module
+# -------------------------------------
+
+
+def cdiv(x: int, y: int):
+    return (x + y - 1) // y
+
+
+def next_power_of_2(n: int):
+    """Return the smallest power of 2 greater than or equal to n"""
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    n += 1
+    return n

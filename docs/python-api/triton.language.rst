@@ -11,6 +11,7 @@ Programming Model
     :toctree: generated
     :nosignatures:
 
+    tensor
     program_id
     num_programs
 
@@ -23,7 +24,10 @@ Creation Ops
     :nosignatures:
 
     arange
+    cat
+    full
     zeros
+    zeros_like
 
 
 Shape Manipulation Ops
@@ -33,10 +37,17 @@ Shape Manipulation Ops
     :toctree: generated
     :nosignatures:
 
+    broadcast
     broadcast_to
-    reshape
+    expand_dims
+    interleave
+    join
+    permute
     ravel
-
+    reshape
+    split
+    trans
+    view
 
 
 Linear Algebra Ops
@@ -49,7 +60,7 @@ Linear Algebra Ops
     dot
 
 
-Memory Ops
+Memory/Pointer Ops
 ----------
 
 .. autosummary::
@@ -58,8 +69,8 @@ Memory Ops
 
     load
     store
-    atomic_cas
-    atomic_xchg
+    make_block_ptr
+    advance
 
 
 Indexing Ops
@@ -69,7 +80,9 @@ Indexing Ops
     :toctree: generated
     :nosignatures:
 
+    flip
     where
+    swizzle2d
 
 
 Math Ops
@@ -79,13 +92,29 @@ Math Ops
     :toctree: generated
     :nosignatures:
 
-    exp
-    log
+    abs
+    cdiv
+    ceil
+    clamp
     cos
-    sin
-    sqrt
+    div_rn
+    erf
+    exp
+    exp2
+    fdiv
+    floor
+    fma
+    log
+    log2
+    maximum
+    minimum
+    rsqrt
     sigmoid
+    sin
     softmax
+    sqrt
+    sqrt_rn
+    umulhi
 
 
 Reduction Ops
@@ -95,10 +124,26 @@ Reduction Ops
     :toctree: generated
     :nosignatures:
 
+    argmax
+    argmin
     max
     min
+    reduce
     sum
+    xor_sum
 
+Scan/Sort Ops
+-------------
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    associative_scan
+    cumprod
+    cumsum
+    histogram
+    sort
 
 Atomic Ops
 ----------
@@ -107,23 +152,14 @@ Atomic Ops
     :toctree: generated
     :nosignatures:
 
-    atomic_cas
     atomic_add
+    atomic_and
+    atomic_cas
     atomic_max
     atomic_min
-
-
-Comparison ops
---------------
-
-.. autosummary::
-    :toctree: generated
-    :nosignatures:
-
-    minimum
-    maximum
-
-.. _Random Number Generation:
+    atomic_or
+    atomic_xchg
+    atomic_xor
 
 Random Number Generation
 ------------------------
@@ -138,6 +174,27 @@ Random Number Generation
     randn
 
 
+Iterators
+-----------------
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    range
+    static_range
+
+
+Inline Assembly
+-----------------
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    inline_asm_elementwise
+
+
 Compiler Hint Ops
 -----------------
 
@@ -145,4 +202,20 @@ Compiler Hint Ops
     :toctree: generated
     :nosignatures:
 
+    debug_barrier
+    max_constancy
+    max_contiguous
     multiple_of
+
+
+Debug Ops
+-----------------
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+
+    static_print
+    static_assert
+    device_print
+    device_assert

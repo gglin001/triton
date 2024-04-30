@@ -8,6 +8,9 @@ namespace triton {
 
 std::unique_ptr<Pass> createCombineOpsPass();
 
+std::unique_ptr<Pass> createReorderBroadcastPass();
+std::unique_ptr<Pass> createRewriteTensorPointerPass();
+
 } // namespace triton
 
 #define GEN_PASS_REGISTRATION

@@ -19,4 +19,26 @@ def TritonCombineOps : Pass</*cli-arg*/"triton-combine", /*Op*/"mlir::ModuleOp">
   let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 
+def TritonReorderBroadcast : Pass</*cli-arg*/"triton-reorder-broadcast", /*Op*/"mlir::ModuleOp"> {
+  let summary = "Moves broadcast and splat after elementwise operations";
+  let description = [{
+    elementwise(splat(a), splat(b), ...) => splat(elementwise(a, b, ...))
+  }];
+  let constructor = "mlir::triton::createReorderBroadcastPass()";
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
+def TritonRewriteTensorPointer : Pass</*cli-arg*/"triton-rewrite-tensor-pointer", /*Op*/"mlir::ModuleOp"> {
+  let summary = "Rewrite load/stores with tensor pointers into legacy load/stores";
+  let description = [{
+    This pass rewrites all load/store semantics initiated by a `tt.make_tensor_ptr` and `tt.advance` into legacy
+    semantics. After this pass, `tt.make_tensor_ptr` and `tt.advance` will disappear, and it generates logics to compute
+    the pointer/mask/other for each load/store.
+  }];
+
+  let constructor = "mlir::triton::createRewriteTensorPointerPass()";
+
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
+
 #endif

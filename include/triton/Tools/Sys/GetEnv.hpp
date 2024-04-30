@@ -23,10 +23,28 @@
 #define TDL_TOOLS_SYS_GETENV_HPP
 
 #include <algorithm>
+#include <assert.h>
 #include <cstdlib>
+#include <set>
+#include <sstream>
 #include <string>
 
-namespace triton {
+namespace mlir::triton {
+
+inline const std::set<std::string> ENV_VARS = {
+    "AMDGCN_ENABLE_DUMP",
+    "DISABLE_FAST_REDUCTION",
+    "DISABLE_LLVM_OPT",
+    "DISABLE_MMA_V3",
+    "DISABLE_PTXAS_OPT",
+    "LLVM_IR_ENABLE_DUMP",
+    "MLIR_ENABLE_DUMP",
+    "TRITON_DISABLE_LINE_INFO",
+    "TRITON_DISABLE_RESHAPE_ENCODING_INFERENCE",
+    "MLIR_ENABLE_DIAGNOSTICS",
+    "TRITON_ENABLE_LLVM_DEBUG",
+    "USE_TTGIR_LOC",
+};
 
 namespace tools {
 
@@ -39,15 +57,16 @@ inline std::string getenv(const char *name) {
 }
 
 inline bool getBoolEnv(const std::string &env) {
+  assert(ENV_VARS.find(env.c_str()) != ENV_VARS.end() &&
+         "envvar is not recognized");
   const char *s = std::getenv(env.c_str());
   std::string str(s ? s : "");
   std::transform(str.begin(), str.end(), str.begin(),
                  [](unsigned char c) { return std::tolower(c); });
-  return (str == "on" || str == "true" || str == "1");
+  return str == "on" || str == "true" || str == "1";
 }
 
 } // namespace tools
-
-} // namespace triton
+} // namespace mlir::triton
 
 #endif

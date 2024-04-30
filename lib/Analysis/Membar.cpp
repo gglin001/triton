@@ -9,22 +9,28 @@
 
 namespace mlir {
 
-void MembarAnalysis::run() {
-  auto *operation = allocation->getOperation();
-  OpBuilder builder(operation);
-  resolve(operation, &builder);
+void MembarAnalysis::run(FuncBlockInfoMapT &funcBlockInfoMap) {
+  FunctionOpInterface funcOp =
+      dyn_cast<FunctionOpInterface>(allocation->getOperation());
+  OpBuilder builder(funcOp.getContext());
+  resolve(funcOp, &funcBlockInfoMap, &builder);
 }
 
-void MembarAnalysis::resolve(Operation *operation, OpBuilder *builder) {
+void MembarAnalysis::resolve(FunctionOpInterface funcOp,
+                             FuncBlockInfoMapT *funcBlockInfoMap,
+                             OpBuilder *builder) {
   // Initialize the blockList
+  DenseMap<Block *, BlockInfo> inputBlockInfoMap;
+  DenseMap<Block *, BlockInfo> outputBlockInfoMap;
   std::deque<Block *> blockList;
-  operation->walk<WalkOrder::PreOrder>([&](Block *block) {
+  funcOp.walk<WalkOrder::PreOrder>([&](Block *block) {
     for (auto &op : block->getOperations()) {
       // Check if the operation belongs to scf dialect, if so, we need to
       // throw an error
       if (op.getDialect()->getNamespace() == "scf") {
-        op.emitError("scf dialect is not supported in membar. Please lower it "
-                     "to cf dialect first.");
+        llvm::report_fatal_error(
+            "scf dialect is not supported in membar. Please lower it "
+            "to cf dialect first.");
         return;
       }
     }
@@ -37,13 +43,13 @@ void MembarAnalysis::resolve(Operation *operation, OpBuilder *builder) {
     auto *block = blockList.front();
     blockList.pop_front();
     // Make a copy of the inputblockInfo but not update
-    auto inputBlockInfo = inputBlockInfoMap.lookup(block);
+    auto inputBlockInfo = inputBlockInfoMap[block];
     SmallVector<Block *> successors;
     for (auto &op : block->getOperations()) {
       if (op.hasTrait<OpTrait::IsTerminator>()) {
         visitTerminator(&op, successors);
       } else {
-        update(&op, &inputBlockInfo, builder);
+        update(&op, &inputBlockInfo, funcBlockInfoMap, builder);
       }
     }
     // Get the reference because we want to update if it changed
@@ -61,28 +67,46 @@ void MembarAnalysis::resolve(Operation *operation, OpBuilder *builder) {
       blockList.emplace_back(successor);
     }
   }
+
+  // Update the final dangling buffers that haven't been synced
+  auto &funcBlockInfo = (*funcBlockInfoMap)[funcOp];
+  funcOp.walk<WalkOrder::PreOrder>([&](Block *block) {
+    block->walk([&](triton::ReturnOp returnOp) {
+      funcBlockInfo.join(outputBlockInfoMap[block]);
+    });
+  });
 }
 
 void MembarAnalysis::visitTerminator(Operation *op,
                                      SmallVector<Block *> &successors) {
   if (auto branchInterface = dyn_cast<BranchOpInterface>(op)) {
     Block *parentBlock = branchInterface->getBlock();
-    for (Block *successor : parentBlock->getSuccessors()) {
-      successors.push_back(successor);
-    }
+    successors.append(std::begin(parentBlock->getSuccessors()),
+                      std::end(parentBlock->getSuccessors()));
     return;
   }
   // Otherwise, it could be a return op
-  assert(isa<func::ReturnOp>(op) && "Unknown terminator");
+  if (isa<triton::ReduceReturnOp, triton::ScanReturnOp, triton::ReturnOp>(op)) {
+    return;
+  }
+  llvm_unreachable("Unknown terminator encountered in membar analysis");
+}
+
+void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
+  OpBuilder::InsertionGuard g(*builder);
+  auto barrierOp = builder->create<gpu::BarrierOp>(op->getLoc());
 }
 
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
+                            FuncBlockInfoMapT *funcBlockInfoMap,
                             OpBuilder *builder) {
-  if (isa<triton::gpu::ExtractSliceOp>(op) ||
-      isa<triton::gpu::AllocTensorOp>(op) || isa<triton::TransOp>(op)) {
-    // alloc is an allocation op without memory write.
-    // FIXME(Keren): extract_slice is always alias for now
+  if (isa<triton::gpu::LocalDeallocOp, triton::gpu::MemDescSubviewOp,
+          triton::TransOp>(op)) {
     return;
+  }
+  if (auto alloc = dyn_cast<triton::gpu::LocalAllocOp>(op)) {
+    if (!alloc.getSrc())
+      return;
   }
 
   if (isa<gpu::BarrierOp>(op)) {
@@ -95,53 +119,62 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
       !isa<gpu::BarrierOp>(op->getNextNode())) {
     // If the current op is an async wait and the next op is not a barrier we
     // insert a barrier op and sync
-    blockInfo->sync();
-    OpBuilder::InsertionGuard g(*builder);
     builder->setInsertionPointAfter(op);
-    builder->create<gpu::BarrierOp>(op->getLoc());
+    insertBarrier(op, builder);
     blockInfo->sync();
     return;
   }
 
   BlockInfo curBlockInfo;
-  for (Value value : op->getOperands()) {
-    for (auto bufferId : allocation->getBufferIds(value)) {
-      if (bufferId != Allocation::InvalidBufferId) {
-        if (isa<triton::gpu::InsertSliceAsyncOp>(op) ||
-            isa<tensor::InsertSliceOp>(op)) {
-          // FIXME(Keren): insert_slice and insert_slice_async are always
-          // alias for now
-          curBlockInfo.syncWriteBuffers.insert(bufferId);
-        } else {
-          // ConvertLayoutOp: shared memory -> registers
-          curBlockInfo.syncReadBuffers.insert(bufferId);
+  if (isa<triton::CallOp>(op)) {
+    // Inter-function dependencies
+    auto callOpInterface = dyn_cast<CallOpInterface>(op);
+    if (auto callee =
+            dyn_cast<FunctionOpInterface>(callOpInterface.resolveCallable())) {
+      curBlockInfo = funcBlockInfoMap->lookup(callee);
+    }
+  } else {
+    // Intra-function dependencies
+    for (Value value : op->getOperands()) {
+      for (auto bufferId : allocation->getBufferIds(value)) {
+        if (bufferId != Allocation::InvalidBufferId) {
+          if (isa<triton::gpu::AsyncCopyGlobalToLocalOp>(op)) {
+            // Global -> shared memory
+            curBlockInfo.syncWriteIntervals.insert(
+                allocation->getAllocatedInterval(bufferId));
+          } else {
+            // ConvertLayoutOp: shared memory -> registers
+            curBlockInfo.syncReadIntervals.insert(
+                allocation->getAllocatedInterval(bufferId));
+          }
         }
       }
     }
-  }
-  for (Value value : op->getResults()) {
-    // ConvertLayoutOp: registers -> shared memory
-    auto bufferId = allocation->getBufferId(value);
+    for (Value value : op->getResults()) {
+      // ConvertLayoutOp: registers -> shared memory
+      auto bufferId = allocation->getBufferId(value);
+      if (bufferId != Allocation::InvalidBufferId) {
+        curBlockInfo.syncWriteIntervals.insert(
+            allocation->getAllocatedInterval(bufferId));
+      }
+    }
+    // Scratch buffer is considered as both shared memory write & read
+    auto bufferId = allocation->getBufferId(op);
     if (bufferId != Allocation::InvalidBufferId) {
-      curBlockInfo.syncWriteBuffers.insert(bufferId);
+      curBlockInfo.syncWriteIntervals.insert(
+          allocation->getAllocatedInterval(bufferId));
+      curBlockInfo.syncReadIntervals.insert(
+          allocation->getAllocatedInterval(bufferId));
     }
   }
-  // Scratch buffer is considered as both shared memory write & read
-  auto bufferId = allocation->getBufferId(op);
-  if (bufferId != Allocation::InvalidBufferId) {
-    curBlockInfo.syncWriteBuffers.insert(bufferId);
-    curBlockInfo.syncReadBuffers.insert(bufferId);
-  }
 
-  if (blockInfo->isIntersected(curBlockInfo, allocation)) {
-    OpBuilder::InsertionGuard g(*builder);
+  if (blockInfo->isIntersected(curBlockInfo)) {
     builder->setInsertionPoint(op);
-    builder->create<gpu::BarrierOp>(op->getLoc());
+    insertBarrier(op, builder);
     blockInfo->sync();
   }
   // Update the region info, even if barrier is inserted, we have to maintain
   // the current op's read/write buffers.
   blockInfo->join(curBlockInfo);
 }
-
 } // namespace mlir

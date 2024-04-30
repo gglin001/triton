@@ -1,7 +1,12 @@
 name: Torchinductor
 
 on:
+  workflow_run:
+    workflows: ["Wheels"]
+    types: [completed]
   workflow_dispatch:
+
+permissions: read-all
 
 jobs:
   Runner-Preparation:
@@ -14,26 +19,27 @@ jobs:
         run: |
           echo '::set-output name=matrix::[["self-hosted", "A100"]]'
 
-  Integration-Tests:
+  Torch-Inductor-Tests:
     needs: Runner-Preparation
+    timeout-minutes: 240  # 4 hours
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         runner: ${{fromJson(needs.Runner-Preparation.outputs.matrix)}}
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-      #- name: Packages
-      #  run: |
-      #    ./.github/workflows/torchinductor/scripts/install_torchinductor.sh
+        uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          ./.github/workflows/torch-inductor/scripts/install_torchinductor.sh torchbench
       - name: Environment
         run: |
-          source /opt/torchinductor_venv/bin/activate
-          ./.github/workflows/torchinductor/scripts/install_triton.sh
+          source /tmp/torchinductor_venv/bin/activate
+          ./.github/workflows/torch-inductor/scripts/install_triton.sh
       - name: Performance
         run: |
-          ./.github/workflows/torchinductor/scripts/run_torchinductor_perf.sh
+          ./.github/workflows/torch-inductor/scripts/run_torchinductor_perf.sh torchbench
       # Runs too long time
       #- name: Accuracy
       #  run: |
-      #    ./.github/workflows/torchinductor/scripts/run_torchinductor_acc.sh
+      #    ./.github/workflows/torch-inductor/scripts/run_torchinductor_acc.sh torchbench

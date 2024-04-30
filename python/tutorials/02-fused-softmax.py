@@ -7,8 +7,11 @@ than PyTorch's native op for a particular class of matrices: those whose rows ca
 the GPU's SRAM.
 
 In doing so, you will learn about:
-- The benefits of kernel fusion for bandwidth-bound operations.
-- Reduction operators in Triton.
+
+* The benefits of kernel fusion for bandwidth-bound operations.
+
+* Reduction operators in Triton.
+
 """
 
 # %%
@@ -68,10 +71,7 @@ def naive_softmax(x):
 
 
 @triton.jit
-def softmax_kernel(
-    output_ptr, input_ptr, input_row_stride, output_row_stride, n_cols,
-    BLOCK_SIZE: tl.constexpr
-):
+def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n_cols, BLOCK_SIZE: tl.constexpr):
     # The rows of the softmax are independent, so we parallelize across those
     row_idx = tl.program_id(0)
     # The stride represents how much we need to increase the pointer to advance 1 row
@@ -115,7 +115,7 @@ def softmax(x):
     y = torch.empty_like(x)
     # Enqueue kernel. The 1D launch grid is simple: we have one kernel instance per row o
     # f the input matrix
-    softmax_kernel[(n_rows,)](
+    softmax_kernel[(n_rows, )](
         y,
         x,
         x.stride(0),
@@ -155,9 +155,7 @@ assert torch.allclose(y_triton, y_torch), (y_triton, y_torch)
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],  # argument names to use as an x-axis for the plot
-        x_vals=[
-            128 * i for i in range(2, 100)
-        ],  # different possible values for `x_name`
+        x_vals=[128 * i for i in range(2, 100)],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=[
             'triton',
@@ -173,16 +171,16 @@ assert torch.allclose(y_triton, y_torch), (y_triton, y_torch)
         ylabel="GB/s",  # label name for the y-axis
         plot_name="softmax-performance",  # name for the plot. Used also as a file name for saving the plot.
         args={'M': 4096},  # values for function arguments not in `x_names` and `y_name`
-    )
-)
+    ))
 def benchmark(M, N, provider):
     x = torch.randn(M, N, device='cuda', dtype=torch.float32)
+    quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch-native':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.softmax(x, axis=-1))
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.softmax(x, axis=-1), quantiles=quantiles)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax(x))
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: softmax(x), quantiles=quantiles)
     if provider == 'torch-jit':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_softmax(x))
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_softmax(x), quantiles=quantiles)
     gbps = lambda ms: 2 * x.nelement() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 

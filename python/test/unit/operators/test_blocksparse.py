@@ -2,22 +2,54 @@ import pytest
 import torch
 
 import triton
+import triton.ops
+
+
+def is_hip_mi200():
+    target = triton.runtime.driver.active.get_current_target()
+    return target.backend == 'hip' and target.arch == 'gfx90a'
+
+
+def sparsify_tensor(x, mask, block):
+    ret = torch.empty((x.size(0), mask.sum(), block, block), dtype=x.dtype, device=x.device)
+    for idx, (h, i, j) in enumerate(zip(*mask.nonzero(as_tuple=True))):
+        ret[:, idx, :, :] = x[:, h, i * block:(i + 1) * block, j * block:(j + 1) * block]
+    return ret
+
+
+def make_pair(shape, device="cuda", alpha=1e-2, beta=0., trans=False, data=None, dtype=torch.float32):
+    if data is None:
+        data = torch.randn(shape, dtype=torch.float32, requires_grad=True, device=device)
+    ref_ret = data
+    ref_ret = ref_ret * alpha + beta
+    ref_ret = ref_ret.half().to(dtype)
+    if trans:
+        ref_ret = ref_ret.t().requires_grad_()
+    ref_ret = ref_ret.detach().requires_grad_()
+    tri_ret = ref_ret.clone().detach().requires_grad_()
+    return ref_ret, tri_ret
+
+
+def mask_tensor(x, mask, block, value=0):
+    ret = x.clone()
+    for h, i, j in zip(*(mask == 0).nonzero(as_tuple=True)):
+        ret[:, h, i * block:(i + 1) * block, j * block:(j + 1) * block] = value
+    return ret
 
 
 @pytest.mark.parametrize("MODE", ["sdd", "dds", "dsd"])
 @pytest.mark.parametrize("TRANS_A", [False, True])
 @pytest.mark.parametrize("TRANS_B", [False, True])
 @pytest.mark.parametrize("BLOCK", [16, 32, 64])
-# TODO: float32 fails
 @pytest.mark.parametrize("DTYPE", [torch.float16])
-def test_matmul(MODE, TRANS_A, TRANS_B, BLOCK, DTYPE, Z=3, H=2, M=512, N=384, K=256):
+def test_matmul(MODE, TRANS_A, TRANS_B, BLOCK, DTYPE, device, Z=3, H=2, M=512, N=384, K=256):
     seed = 0
     torch.manual_seed(seed)
     is_sdd = MODE == "sdd"
     is_dsd = MODE == "dsd"
     is_dds = MODE == "dds"
-    do_sparsify = lambda x: triton.testing.sparsify_tensor(x, layout, BLOCK)
-    do_mask = lambda x: triton.testing.mask_tensor(x, layout, BLOCK)
+    do_sparsify = lambda x: sparsify_tensor(x, layout, BLOCK)
+    do_mask = lambda x: mask_tensor(x, layout, BLOCK)
     # create inputs
     # create op
     a_shape = (Z, H, K, M) if TRANS_A else (Z, H, M, K)
@@ -32,17 +64,16 @@ def test_matmul(MODE, TRANS_A, TRANS_B, BLOCK, DTYPE, Z=3, H=2, M=512, N=384, K=
     layout[1, 2, :] = 0
     layout[1, :, 1] = 0
     # create data
-    a_ref, a_tri = triton.testing.make_pair(a_shape, alpha=.1, dtype=DTYPE)
-    b_ref, b_tri = triton.testing.make_pair(b_shape, alpha=.1, dtype=DTYPE)
-    dc_ref, dc_tri = triton.testing.make_pair(c_shape, dtype=DTYPE)
+    a_ref, a_tri = make_pair(a_shape, alpha=.1, dtype=DTYPE)
+    b_ref, b_tri = make_pair(b_shape, alpha=.1, dtype=DTYPE)
+    dc_ref, dc_tri = make_pair(c_shape, dtype=DTYPE)
     # compute [torch]
     dc_ref = do_mask(dc_ref) if is_sdd else dc_ref
     a_ref = do_mask(a_ref) if is_dsd else a_ref
     b_ref = do_mask(b_ref) if is_dds else b_ref
     a_ref.retain_grad()
     b_ref.retain_grad()
-    c_ref = torch.matmul(a_ref.transpose(2, 3) if TRANS_A else a_ref,
-                         b_ref.transpose(2, 3) if TRANS_B else b_ref)
+    c_ref = torch.matmul(a_ref.transpose(2, 3) if TRANS_A else a_ref, b_ref.transpose(2, 3) if TRANS_B else b_ref)
     c_ref.backward(dc_ref)
     c_ref = do_sparsify(c_ref) if is_sdd else c_ref
     da_ref = do_sparsify(a_ref.grad) if is_dsd else a_ref.grad
@@ -53,15 +84,21 @@ def test_matmul(MODE, TRANS_A, TRANS_B, BLOCK, DTYPE, Z=3, H=2, M=512, N=384, K=
     b_tri = do_sparsify(b_tri) if is_dds else b_tri
     a_tri.retain_grad()
     b_tri.retain_grad()
-    op = triton.ops.blocksparse.matmul(layout, BLOCK, MODE, trans_a=TRANS_A, trans_b=TRANS_B, device="cuda")
-    c_tri = triton.testing.catch_oor(lambda: op(a_tri, b_tri), pytest)
-    triton.testing.catch_oor(lambda: c_tri.backward(dc_tri), pytest)
+    op = triton.ops.blocksparse.matmul(layout, BLOCK, MODE, trans_a=TRANS_A, trans_b=TRANS_B, device=device)
+    c_tri = op(a_tri, b_tri)
+    c_tri.backward(dc_tri)
     da_tri = a_tri.grad
     db_tri = b_tri.grad
+
+    # Bigger tolerance for AMD MI200 devices.
+    # MI200 devices use reduced precision fp16 and bf16 and flush input and
+    # output denormal values to zero. Detailed info is at: https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+    tol = {'atol': 1e-3, 'rtol': 0} if is_hip_mi200() else {}
+
     # compare
-    triton.testing.assert_almost_equal(c_ref, c_tri)
-    triton.testing.assert_almost_equal(da_ref, da_tri)
-    triton.testing.assert_almost_equal(db_ref, db_tri)
+    torch.testing.assert_close(c_ref, c_tri, **tol)
+    torch.testing.assert_close(da_ref, da_tri, **tol)
+    torch.testing.assert_close(db_ref, db_tri, **tol)
 
 
 configs = [
@@ -74,7 +111,7 @@ configs = [
 
 @pytest.mark.parametrize("is_dense", [False, True])
 @pytest.mark.parametrize("BLOCK, WIDTH", configs)
-def test_softmax(BLOCK, WIDTH, is_dense, Z=2, H=2, is_causal=True, scale=0.4):
+def test_softmax(BLOCK, WIDTH, is_dense, device, Z=2, H=2, is_causal=True, scale=0.4):
     # set seed
     torch.random.manual_seed(0)
     Z, H, M, N = 2, 3, WIDTH, WIDTH
@@ -88,31 +125,31 @@ def test_softmax(BLOCK, WIDTH, is_dense, Z=2, H=2, is_causal=True, scale=0.4):
         layout[1, :, 1] = 0
     # initialize data
     a_shape = (Z, H, M, N)
-    a_ref, a_tri = triton.testing.make_pair(a_shape)
-    dout_ref, dout_tri = triton.testing.make_pair(a_shape)
+    a_ref, a_tri = make_pair(a_shape)
+    dout_ref, dout_tri = make_pair(a_shape)
     # compute [torch]
-    a_ref = triton.testing.mask_tensor(a_ref, layout, BLOCK, value=float("-inf"))
+    a_ref = mask_tensor(a_ref, layout, BLOCK, value=float("-inf"))
     a_ref.retain_grad()
-    at_mask = torch.ones((M, N), device="cuda")
+    at_mask = torch.ones((M, N), device=device)
     if is_causal:
         at_mask = torch.tril(at_mask)
     M = at_mask[None, None, :, :] + torch.zeros_like(a_ref)
     a_ref[M == 0] = float("-inf")
     out_ref = torch.softmax(a_ref * scale, -1)
     out_ref.backward(dout_ref)
-    out_ref = triton.testing.sparsify_tensor(out_ref, layout, BLOCK)
-    da_ref = triton.testing.sparsify_tensor(a_ref.grad, layout, BLOCK)
+    out_ref = sparsify_tensor(out_ref, layout, BLOCK)
+    da_ref = sparsify_tensor(a_ref.grad, layout, BLOCK)
     # compute [triton]
-    a_tri = triton.testing.sparsify_tensor(a_tri, layout, BLOCK)
+    a_tri = sparsify_tensor(a_tri, layout, BLOCK)
     a_tri.retain_grad()
-    dout_tri = triton.testing.sparsify_tensor(dout_tri, layout, BLOCK)
-    op = triton.ops.blocksparse.softmax(layout, BLOCK, device="cuda", is_dense=is_dense)
+    dout_tri = sparsify_tensor(dout_tri, layout, BLOCK)
+    op = triton.ops.blocksparse.softmax(layout, BLOCK, device=device, is_dense=is_dense)
     out_tri = op(a_tri, scale=scale, is_causal=is_causal)
     out_tri.backward(dout_tri)
     da_tri = a_tri.grad
     # compare
-    triton.testing.assert_almost_equal(out_tri, out_ref)
-    triton.testing.assert_almost_equal(da_tri, da_ref)
+    torch.testing.assert_close(out_tri, out_ref, equal_nan=True)
+    torch.testing.assert_close(da_tri, da_ref, equal_nan=True)
 
 
 @pytest.mark.parametrize("block", [16, 32, 64])
@@ -120,6 +157,7 @@ def test_softmax(BLOCK, WIDTH, is_dense, Z=2, H=2, is_causal=True, scale=0.4):
 def test_attention_fwd_bwd(
     block,
     dtype,
+    device,
     input_scale=1.0,
     scale=1 / 8.0,
     n_ctx=256,
@@ -145,13 +183,13 @@ def test_attention_fwd_bwd(
     value.retain_grad()
     attn_out = triton_attention(layout, block, query=query, key=key, value=value, scale=scale)
     # ad hoc loss
-    loss = (attn_out ** 2).mean()
+    loss = (attn_out**2).mean()
     loss.backward()
     grads = [query.grad, key.grad, value.grad]
 
     # Torch version:
     torch_q, torch_k, torch_v = [x.clone() for x in qkvs]
-    attn_mask = torch.ones([n_ctx, n_ctx], device="cuda", dtype=dtype)
+    attn_mask = torch.ones([n_ctx, n_ctx], device=device, dtype=dtype)
     attn_mask = torch.tril(attn_mask, diagonal=0)
     attn_mask = 1e6 * (-1 + (attn_mask.reshape((1, 1, n_ctx, n_ctx)).cuda()))
     torch_q.retain_grad()
@@ -162,15 +200,20 @@ def test_attention_fwd_bwd(
     probs = torch.softmax(scores, dim=-1)
     torch_attn_out = torch.einsum("bhst,bhtd->bhsd", probs, torch_v)
     # ad hoc loss
-    torch_loss = (torch_attn_out ** 2).mean()
+    torch_loss = (torch_attn_out**2).mean()
     torch_loss.backward()
     torch_grads = [torch_q.grad, torch_k.grad, torch_v.grad]
 
     # comparison
     # print(f"Triton loss {loss} and torch loss {torch_loss}.  Also checking grads...")
-    triton.testing.assert_almost_equal(loss, torch_loss)
+    torch.testing.assert_close(loss, torch_loss, atol=1e-3, rtol=0)
+
+    # Bigger tolerance for AMD MI200 devices.
+    # MI200 devices use reduced precision fp16 and bf16 and flush input and
+    # output denormal values to zero. Detailed info is at: https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+    tol = {'atol': 1e-3, 'rtol': 0} if is_hip_mi200() else {}
     for g1, g2 in zip(grads, torch_grads):
-        triton.testing.assert_almost_equal(g1, g2)
+        torch.testing.assert_close(g1, g2, **tol)
 
 
 @pytest.mark.parametrize("block", [16, 32, 64])
@@ -182,8 +225,10 @@ def triton_attention(
     value: torch.Tensor,
     scale: float,
 ):
-    sparse_dot_sdd_nt = triton.ops.blocksparse.matmul(layout, block, "sdd", trans_a=False, trans_b=True, device=value.device)
-    sparse_dot_dsd_nn = triton.ops.blocksparse.matmul(layout, block, "dsd", trans_a=False, trans_b=False, device=value.device)
+    sparse_dot_sdd_nt = triton.ops.blocksparse.matmul(layout, block, "sdd", trans_a=False, trans_b=True,
+                                                      device=value.device)
+    sparse_dot_dsd_nn = triton.ops.blocksparse.matmul(layout, block, "dsd", trans_a=False, trans_b=False,
+                                                      device=value.device)
     sparse_softmax = triton.ops.blocksparse.softmax(layout, block, device=value.device)
 
     w = sparse_dot_sdd_nt(query, key)
