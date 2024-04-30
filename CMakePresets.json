@@ -12,10 +12,14 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
         "CMAKE_C_COMPILER": "/usr/bin/clang",
         "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
-        "TRITON_BUILD_UT": false,
         "LLVM_DIR": "/iree-llvm-project/build/install/lib/cmake/llvm",
         "MLIR_DIR": "/iree-llvm-project/build/install/lib/cmake/mlir",
-        "LLVM_LIBRARY_DIR": "/iree-llvm-project/build/install/lib/cmake/llvm"
+        "LLVM_LIBRARY_DIR": "/iree-llvm-project/build/install/lib/cmake/llvm",
+        "TRITON_BUILD_PYTHON_MODULE": true,
+        "TRITON_BUILD_PROTON": false,
+        "TRITON_BUILD_UT": false,
+        "TRITON_CODEGEN_BACKENDS": "nvidia;amd",
+        "UNUSED": "UNUSED"
       }
     }
   ]
