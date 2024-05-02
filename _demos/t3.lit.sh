@@ -21,8 +21,10 @@ lit "${args[@]}"
 
 ###############################################################################
 
-alias FileCheck="FileCheck -v --dump-input=always --color"
-which FileCheck
+# alias FileCheck="FileCheck --vv --dump-input=always --color=1"
+# which FileCheck
+
+export FILECHECK_OPTS="--vv --dump-input=always --color=1"
 
 ###############################################################################
 
