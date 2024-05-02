@@ -1,10 +1,14 @@
+###############################################################################
+
+# "TRITON_PLUGIN_DIRS": "${sourceDir}/triton-shared",
+git clone git@github.com:microsoft/triton-shared.git
+
 # build & install targets with cmake(cmake presets) in vscode
 
 ###############################################################################
 
 # "TRITON_BUILD_PYTHON_MODULE": true,
 rm $PWD/python/triton/_C/libtriton.so
-# cp build/libtriton.so python/triton/_C/
 ln -sf $PWD/build/libtriton.so $PWD/python/triton/_C/
 
 pushd python
@@ -16,12 +20,16 @@ python -c "import triton; print(triton.__version__)"
 ###############################################################################
 
 micromamba install mypy
-# stubgen -m triton._C.libtriton -o python/
-# stubgen -m triton._C.libtriton.triton -o python/
-# stubgen -m triton._C.libtriton.triton.runtime -m triton._C.libtriton.triton.ir -o python/
-stubgen -m triton._C.libtriton -m triton._C.libtriton.triton -m triton._C.libtriton.triton.runtime -m triton._C.libtriton.triton.ir -o python/
 
-echo "from . import ir" >>python/triton/_C/libtriton/triton/__init__.pyi
-echo "from . import runtime" >>python/triton/_C/libtriton/triton/__init__.pyi
+mkdir -p python/triton/_C/libtriton
+args=(
+  -m triton._C.libtriton
+  -m triton._C.libtriton.ir
+  -m triton._C.libtriton.passes
+  -m triton._C.libtriton.interpreter
+  -m triton._C.libtriton.llvm
+  -o python
+)
+stubgen "${args[@]}"
 
 ###############################################################################
