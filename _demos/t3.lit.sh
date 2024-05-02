@@ -20,3 +20,11 @@ lit "${args[@]}"
 # lit "${args[@]}" | tee _demos/lit.run.dirty.mlir
 
 ###############################################################################
+
+alias FileCheck="FileCheck -v --dump-input=always --color"
+which FileCheck
+
+###############################################################################
+
+triton-opt test/Conversion/amd/fp_to_fp.mlir --split-input-file --convert-triton-amdgpu-to-llvm=arch=gfx942 |
+  FileCheck test/Conversion/amd/fp_to_fp.mlir
