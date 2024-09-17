@@ -1,5 +1,12 @@
 ###############################################################################
 
+# copy headers
+pushd python
+python setup.py
+popd
+
+###############################################################################
+
 # "TRITON_PLUGIN_DIRS": "${sourceDir}/triton-shared",
 git clone git@github.com:microsoft/triton-shared.git
 
