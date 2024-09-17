@@ -9,10 +9,14 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#define GEN_PASS_CLASSES
+
+namespace mlir {
+namespace triton {
+namespace gpu {
+
+#define GEN_PASS_DEF_TRITONGPUOPTIMIZETHREADLOCALITY
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
-using namespace mlir;
 namespace {
 // Change the destination layout of reshape ops allowing reorder when used by a
 // reduction in order to minimize the amount of cross thread communication for
@@ -89,7 +93,7 @@ struct OptimizeReshapeLayoutPattern
 } // namespace
 
 class TritonGPUOptimizeThreadLocalityPass
-    : public TritonGPUOptimizeThreadLocalityBase<
+    : public impl::TritonGPUOptimizeThreadLocalityBase<
           TritonGPUOptimizeThreadLocalityPass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
@@ -116,9 +120,12 @@ class TritonGPUOptimizeThreadLocalityPass
       // TODO: relax this restriction
       if (!(isa<triton::gpu::BlockedEncodingAttr>(srcEncoding) && rank > 1))
         return;
+      // The code currently assumes that the reduction is happening on the most
+      // inner dim.
+      if (reduce.getAxis() != rank - 1)
+        return;
       for (auto operand : reduce->getOperands()) {
-        auto def = operand.getDefiningOp();
-        if (!isa<triton::LoadOp>(def))
+        if (!operand.getDefiningOp<triton::LoadOp>())
           return;
       }
       auto elemsPerThread =
@@ -144,7 +151,7 @@ class TritonGPUOptimizeThreadLocalityPass
         return;
       auto argNum = yieldOpOperand.getOperandNumber();
       auto oldAccum = forOp.getInitArgs()[argNum];
-      auto cstOp = dyn_cast<arith::ConstantOp>(oldAccum.getDefiningOp());
+      auto cstOp = oldAccum.getDefiningOp<arith::ConstantOp>();
       if (!cstOp)
         return;
       reduceOps.insert(reduce);
@@ -427,6 +434,6 @@ private:
   }
 };
 
-std::unique_ptr<Pass> mlir::triton::gpu::createOptimizeThreadLocalityPass() {
-  return std::make_unique<TritonGPUOptimizeThreadLocalityPass>();
-}
+} // namespace gpu
+} // namespace triton
+} // namespace mlir

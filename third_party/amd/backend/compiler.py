@@ -1,7 +1,8 @@
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, llvm, amd
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Dict, Tuple
+from types import ModuleType
 import hashlib
 import tempfile
 import os
@@ -9,6 +10,19 @@ import re
 import subprocess
 import functools
 from pathlib import Path
+
+
+def min_dot_size(target: GPUTarget):
+    arch_str = target.arch
+    # CDNA 3.0 supports k==8 in all mfma variants except for int8
+    # (where the smallest `k` supported is 16)
+    if "gfx94" in arch_str:
+        return lambda lhsType, rhsType: (16, 16, 16) if (lhsType.is_int8() or rhsType.is_int8()) else (16, 16, 8)
+    # CDNA 2.0 always supports `k==8`
+    if "gfx9" in arch_str:
+        return lambda lhsType, rhsType: (16, 16, 8)
+    # Other architectures will only support 16,16,16
+    return lambda lhsType, rhsType: (16, 16, 16)
 
 
 @dataclass(frozen=True)
@@ -21,8 +35,8 @@ class HIPOptions:
     cluster_dims: tuple = (1, 1, 1)
     debug: bool = False
     arch: str = None
-    allow_fp8e4nv: bool = False
-    allow_fp8e4b15: bool = False
+    supported_fp8_dtypes: Tuple[str] = ("fp8e5", )
+    deprecated_fp8_dtypes: Tuple[str] = ()
     default_dot_input_precision: str = "ieee"
     allowed_dot_input_precisions: Tuple[str] = ("ieee", )
     enable_fp_fusion: bool = True
@@ -30,6 +44,7 @@ class HIPOptions:
     kpack: int = 1
     allow_flush_denorm: bool = False
     max_num_imprecise_acc_default: int = 0
+    backend_name: str = 'hip'
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -37,7 +52,7 @@ class HIPOptions:
         # Ignore user-defined warp size for gfx9
         warp_size = 32 if 'gfx10' in self.arch or 'gfx11' in self.arch else 64
         object.__setattr__(self, 'warp_size', warp_size)
-        libs = ["cuda2gcn", "opencl", "ocml", "ockl"]
+        libs = ["ocml", "ockl"]
         for lib in libs:
             extern_libs[lib] = str(default_libdir / f'{lib}.bc')
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
@@ -62,6 +77,15 @@ class HIPBackend(BaseBackend):
 
     def parse_options(self, opts) -> Any:
         args = {'arch': self.target.arch}
+
+        if "supported_fp8_dtypes" not in opts:
+            supported_fp8_dtypes = set(HIPOptions.supported_fp8_dtypes)
+            if self.target.arch in ('gfx940', 'gfx941', 'gfx942'):
+                supported_fp8_dtypes.update({'fp8e4b8', 'fp8e5b16'})
+            args["supported_fp8_dtypes"] = tuple(sorted(supported_fp8_dtypes))
+
+        if "enable_fp_fusion" not in opts:
+            args["enable_fp_fusion"] = os.getenv("TRITON_DEFAULT_FP_FUSION", "1") == "1"
         args.update({k: opts[k] for k in HIPOptions.__dataclass_fields__.keys() if k in opts})
         return HIPOptions(**args)
 
@@ -76,15 +100,25 @@ class HIPBackend(BaseBackend):
         )
 
     def get_codegen_implementation(self):
-        codegen_fns = dict()
+        codegen_fns = {"min_dot_size": min_dot_size(self.target)}
         return codegen_fns
+
+    def get_module_map(self) -> Dict[str, ModuleType]:
+        from triton.language.extra.hip import libdevice
+        return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
         amd.load_dialects(ctx)
 
     @staticmethod
     def path_to_rocm_lld():
-        # First check backend for ld.lld (used for pytorch wheels)
+        # Check env path for ld.lld
+        lld_env_path = os.getenv("TRITON_HIP_LLD_PATH")
+        if lld_env_path is not None:
+            lld = Path(lld_env_path)
+            if lld.is_file():
+                return lld
+        # Check backend for ld.lld (used for pytorch wheels)
         lld = Path(__file__).parent / "llvm/bin/ld.lld"
         if lld.is_file():
             return lld
@@ -94,7 +128,7 @@ class HIPBackend(BaseBackend):
         lld = Path("/usr/bin/ld.lld")
         if lld.is_file():
             return lld
-        raise Exception("ROCm linker /opt/rocm/llvm/bin/ld.lld not found")
+        raise Exception("ROCm linker /opt/rocm/llvm/bin/ld.lld not found. Set 'TRITON_HIP_LLD_PATH' to its path.")
 
     @staticmethod
     def make_ttir(mod, metadata, options):
@@ -127,14 +161,25 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_remove_layout_conversions(pm)
         amd.passes.ttgpuir.add_optimize_epilogue(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
-        if options.num_stages == 0 and amd.has_matrix_core_feature(options.arch):
-            amd.passes.ttgpuir.add_stream_pipeline(pm)
+        use_new_pipeliner = os.getenv("TRITON_HIP_USE_NEW_STREAM_PIPELINE", "0") == "1"
+        if amd.has_matrix_core_feature(options.arch):
+            if use_new_pipeliner:
+                # In the old pipeliner we only support num_stages = 0/1, which means something
+                # different than the NVIDIA side. In the new pipeliner we unify the num_stages
+                # interpretation. Default to use 2 stages if not explicitly set.
+                num_stages = options.num_stages if options.num_stages != 0 else 2
+                amd.passes.ttgpuir.add_stream_pipelinev2(pm, num_stages)
+            else:
+                if options.num_stages == 0:
+                    amd.passes.ttgpuir.add_stream_pipeline(pm)
             passes.common.add_canonicalizer(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, True)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
-        if options.num_stages != 0:
+        if use_new_pipeliner or options.num_stages != 0:
             amd.passes.ttgpuir.add_reorder_instructions(pm)
+        amd.passes.ttgpuir.add_canonicalize_pointers(pm)
+        passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         pm.run(mod)
@@ -147,33 +192,49 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         amd.passes.ttgpuir.add_decompose_unsupported_conversions(pm, options.arch)
+        # custom_lds_size is an experimental parameter that defines amount of LDS available
+        # for one thread block. Measured in bytes.
+        #
+        # If custom_lds_size = 0, pass will consider all LDS is available for one threads block,
+        # LDS size is determined by provided arch name.
+        custom_lds_size = 0
+        amd.passes.ttgpuir.add_optimize_lds_usage(pm, options.arch, custom_lds_size)
         passes.convert.add_scf_to_cf(pm)
         passes.convert.add_index_to_llvmir(pm)
 
         passes.ttgpuir.add_allocate_shared_memory(pm)
-        amd.passes.ttgpuir.add_to_llvmir(pm, options.arch)
+        ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
+        ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
+        ##    of the value of kernel arg `allow_flush_denorm`.
+        ## 2. If __HIP_FTZ = 0, whether exp2 flushes denorms in input and output
+        ##    depends on the value of kernel arg `allow_flush_denorm`.
+        ## 3. __HIP_FTZ is default to 1 and not exposed as a kernel argument.
+        ##    For now it is used as a controller for developers only.
+        __HIP_FTZ = True
+        amd.passes.ttgpuir.add_to_llvmir(pm, options.arch, __HIP_FTZ)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
 
         passes.convert.add_cf_to_llvmir(pm)
         passes.convert.add_arith_to_llvmir(pm)
         passes.common.add_canonicalizer(pm)
+        passes.common.add_cse(pm)
+        passes.common.add_symbol_dce(pm)
+        if os.environ.get("TRITON_DISABLE_LINE_INFO", "0") == "0":
+            passes.llvmir.add_di_scope(pm)
         # This pass (`add_builtin_func_to_llvmir`) serves as a temporary workaround to address the issue of excessive basic block
         # count caused by predicated loads/stores. In certain kernels, the addition of these blocks can cause the MLIR
         # canonicalizer to never finish when attempting to merge blocks. The permanent solution under consideration
         # involves using MUBUF instructions that have built-in out-of-bounds checks, which would eliminate the need
         # for conditional branching around memory accesses.
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm)
-        passes.common.add_cse(pm)
-        passes.common.add_symbol_dce(pm)
-        if os.environ.get("TRITON_DISABLE_LINE_INFO", "0") == "0":
-            passes.llvmir.add_di_scope(pm)
         pm.run(mod)
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
         llvm.init_targets()
         context = llvm.context()
         llvm_mod = llvm.to_module(mod, context)
+        amd.attach_target_triple(llvm_mod)
 
         # Set various control constants on the LLVM module so that device
         # libraries can resolve references to them.
@@ -185,23 +246,19 @@ class HIPBackend(BaseBackend):
         amd.set_bool_control_constant(llvm_mod, "__oclc_wavefrontsize64", options.warp_size == 64)
 
         # Set kernel attributes first given this may affect later optimizations.
-        kernels = [fn for fn in llvm_mod.get_functions() if not fn.is_declaration()]
+        fns = [fn for fn in llvm_mod.get_functions() if not fn.is_declaration()]
         # The public kernel should be kernel 0.
-        kernels[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
-        kernels[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{options.num_warps*options.warp_size}")
-        kernels[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}")
+        fns[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
+        fns[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{options.num_warps*options.warp_size}")
+        fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}")
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
-        kernels[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
-        # Hint the compiler that we'd like the firmware to set the kernel arguments
-        # to user SGPRs so that the kernel does not need to s_load its arguments
-        # from memory.
-        amd.set_all_fn_arg_inreg(kernels[0])
+        fns[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
 
         if options.extern_libs:
             paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name)]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
 
         # Get some metadata
         metadata["shared"] = src.get_int_attr("triton_gpu.shared")

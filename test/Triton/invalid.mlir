@@ -1,5 +1,23 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+tt.func @fn(%v: i32) {
+  %b = tt.splat %v : i32 -> tensor<128xi32>
+  // expected-error @+1 {{rank of source must be same as rank of result}}
+  %c = tt.broadcast %b : tensor<128xi32> -> tensor<128x32xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @fn(%v: i32) {
+  %b = tt.splat %v : i32 -> tensor<2x32xi32>
+  // expected-error @+1 {{Different dimensions at index 0 between source and result.  Broadcast requires the source dimension to be 1.}}
+  %c = tt.broadcast %b : tensor<2x32xi32> -> tensor<128x32xi32>
+  tt.return
+}
+
+// -----
+
 tt.func public @fn(%arg0: tensor<128xf32>) {
     // expected-error @+1 {{packed_element}}
     %a = tt.elementwise_inline_asm ""
@@ -181,21 +199,6 @@ tt.func public @fn(%arg0: tensor<2xf32>) {
     %a, %b = tt.split %arg0 : tensor<2xf32> -> tensor<f32> // OK
     tt.return
 }
-
-// -----
-
-// Bad order; should start with 2.
-#blocked  = #triton_gpu.blocked<{sizePerThread = [1,1,2], threadsPerWarp = [1,32,1], warpsPerCTA = [1,1,1], order = [1,2,0]}>
-#blocked1 = #triton_gpu.blocked<{sizePerThread = [1,1], threadsPerWarp = [1,32], warpsPerCTA = [1,1], order = [1,0]}>
-
-module attributes {"triton_gpu.target" = "cuda:80", "triton_gpu.num-ctas" = 1 : i32, "triton_gpu.num-warps" = 1 : i32, "triton_gpu.threads-per-warp" = 32 : i32} {
-tt.func public @fn(%arg0: tensor<2x2x2xf32, #blocked>) {
-    // expected-error @+2 {{last dimension}}
-    // expected-error @+1 {{op failed to infer returned types}}
-    %a, %b = tt.split %arg0 : tensor<2x2x2xf32, #blocked> -> tensor<2x2xf32, #blocked1>
-    tt.return
-}
-}  // end module
 
 // -----
 

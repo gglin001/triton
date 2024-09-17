@@ -1,3 +1,8 @@
+# custom
+CMakeUserPresets.json
+python/triton/_C/libtriton.pyi
+python/triton/_C/libtriton/
+
 # Triton builds
 build/
 build-*/
@@ -45,6 +50,7 @@ ptxas
 
 # Third-party include
 third_party/nvidia/backend/include
+third_party/nvidia/backend/lib/cupti
 
 # Docs
 docs/_build/
@@ -65,6 +71,5 @@ docs/sg_execution_times.rst
 # Vim
 *.swp
 
-CMakeUserPresets.json
-python/triton/_C/libtriton.pyi
-python/triton/_C/libtriton/
+# macOS
+.DS_Store

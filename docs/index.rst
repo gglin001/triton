@@ -25,6 +25,7 @@ Python API
 - :doc:`triton <python-api/triton>`
 - :doc:`triton.language <python-api/triton.language>`
 - :doc:`triton.testing <python-api/triton.testing>`
+- :doc:`Triton semantics <python-api/triton-semantics>`
 
 
 .. toctree::
@@ -35,6 +36,7 @@ Python API
    python-api/triton
    python-api/triton.language
    python-api/triton.testing
+   python-api/triton-semantics
 
 
 Triton MLIR Dialects and Ops
@@ -67,4 +69,4 @@ Check out the following documents to learn more about Triton and how it compares
    programming-guide/chapter-2/related-work
    programming-guide/chapter-3/debugging
 
-.. _Triton: https://github.com/openai/triton
+.. _Triton: https://github.com/triton-lang/triton

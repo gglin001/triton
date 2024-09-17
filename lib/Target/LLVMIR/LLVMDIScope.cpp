@@ -88,7 +88,7 @@ struct LLVMDIScopePass : public LLVMDIScopeBase<LLVMDIScopePass> {
       distinctId = mlir::DistinctAttr::create(mlir::UnitAttr::get(context));
       if (!compileUnitAttr) {
         compileUnitAttr = LLVM::DICompileUnitAttr::get(
-            context, distinctId, llvm::dwarf::DW_LANG_C, fileAttr,
+            distinctId, llvm::dwarf::DW_LANG_C, fileAttr,
             StringAttr::get(context, "triton"),
             /*isOptimized=*/true, LLVM::DIEmissionKind::LineTablesOnly,
             LLVM::DINameTableKind::Default);
@@ -104,9 +104,8 @@ struct LLVMDIScopePass : public LLVMDIScopeBase<LLVMDIScopePass> {
     // the column offset
     auto subprogramAttr = LLVM::DISubprogramAttr::get(
         context, distinctId, compileUnitAttr, fileAttr, funcNameAttr,
-        funcNameAttr, fileAttr,
-        /*line=*/line,
-        /*scopeline=*/line, subprogramFlags, subroutineTypeAttr);
+        funcNameAttr, fileAttr, /*line=*/line, /*scopeline=*/line,
+        subprogramFlags, subroutineTypeAttr, /*retainNodes=*/{});
     funcOp->setLoc(FusedLoc::get(context, {loc}, subprogramAttr));
   }
 

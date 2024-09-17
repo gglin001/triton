@@ -2,6 +2,7 @@ import os
 import platform
 import re
 import contextlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import sysconfig
 import tarfile
 import zipfile
 import urllib.request
+import json
 from io import BytesIO
 from distutils.command.clean import clean
 from pathlib import Path
@@ -23,6 +25,8 @@ from distutils.command.install import install
 from setuptools.command.develop import develop
 from setuptools.command.egg_info import egg_info
 from wheel.bdist_wheel import bdist_wheel
+
+import pybind11
 
 
 @dataclass
@@ -99,6 +103,8 @@ def get_build_type():
         return "RelWithDebInfo"
     elif check_env_flag("TRITON_REL_BUILD_WITH_ASSERTS"):
         return "TritonRelBuildWithAsserts"
+    elif check_env_flag("TRITON_BUILD_WITH_O1"):
+        return "TritonBuildWithO1"
     else:
         # TODO: change to release when stable enough
         return "TritonRelBuildWithAsserts"
@@ -109,6 +115,22 @@ def get_env_with_keys(key: list):
         if k in os.environ:
             return os.environ[k]
     return ""
+
+
+def is_offline_build() -> bool:
+    """
+    Downstream projects and distributions which bootstrap their own dependencies from scratch
+    and run builds in offline sandboxes
+    may set `TRITON_OFFLINE_BUILD` in the build environment to prevent any attempts at downloading
+    pinned dependencies from the internet or at using dependencies vendored in-tree.
+
+    Dependencies must be defined using respective search paths (cf. `syspath_var_name` in `Package`).
+    Missing dependencies lead to an early abortion.
+    Dependencies' compatibility is not verified.
+
+    Note that this flag isn't tested by the CI and does not provide any guarantees.
+    """
+    return check_env_flag("TRITON_OFFLINE_BUILD", "")
 
 
 # --- third party packages -----
@@ -123,16 +145,6 @@ class Package(NamedTuple):
     syspath_var_name: str
 
 
-# pybind11
-def get_pybind11_package_info():
-    pybind11_version_path = os.path.join(get_base_dir(), "cmake", "pybind11-version.txt")
-    with open(pybind11_version_path, "r") as pybind11_version_file:
-        version = pybind11_version_file.read().strip()
-    name = f"pybind11-{version}"
-    url = f"https://github.com/pybind/pybind11/archive/refs/tags/v{version}.tar.gz"
-    return Package("pybind11", name, url, "PYBIND11_INCLUDE_DIR", "", "PYBIND11_SYSPATH")
-
-
 # json
 def get_json_package_info():
     url = "https://github.com/nlohmann/json/releases/download/v3.11.3/include.zip"
@@ -142,13 +154,16 @@ def get_json_package_info():
 # llvm
 def get_llvm_package_info():
     system = platform.system()
-    arch = {"x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}[platform.machine()]
+    try:
+        arch = {"x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}[platform.machine()]
+    except KeyError:
+        arch = platform.machine()
     if system == "Darwin":
         system_suffix = f"macos-{arch}"
     elif system == "Linux":
         if arch == 'arm64':
             system_suffix = 'ubuntu-arm64'
-        else:
+        elif arch == 'x64':
             vglibc = tuple(map(int, platform.libc_ver()[1].split('.')))
             vglibc = vglibc[0] * 100 + vglibc[1]
             if vglibc > 228:
@@ -164,7 +179,15 @@ def get_llvm_package_info():
                 # Manylinux_2014 (v2.17)
                 # CentOS 7 (v2.17)
                 system_suffix = "centos-x64"
+        else:
+            print(
+                f"LLVM pre-compiled image is not available for {system}-{arch}. Proceeding with user-configured LLVM from source build."
+            )
+            return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
     else:
+        print(
+            f"LLVM pre-compiled image is not available for {system}-{arch}. Proceeding with user-configured LLVM from source build."
+        )
         return Package("llvm", "LLVM-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
     # use_assert_enabled_llvm = check_env_flag("TRITON_USE_ASSERT_ENABLED_LLVM", "False")
     # release_suffix = "assert" if use_assert_enabled_llvm else "release"
@@ -172,7 +195,7 @@ def get_llvm_package_info():
     with open(llvm_hash_path, "r") as llvm_hash_file:
         rev = llvm_hash_file.read(8)
     name = f"llvm-{rev}-{system_suffix}"
-    url = f"https://tritonlang.blob.core.windows.net/llvm-builds/{name}.tar.gz"
+    url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
     return Package("llvm", name, url, "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
 
 
@@ -190,7 +213,9 @@ def open_url(url):
 
 
 def get_triton_cache_path():
-    user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
+    user_home = os.getenv("TRITON_HOME")
+    if not user_home:
+        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
     if not user_home:
         raise RuntimeError("Could not find user home directory")
     return os.path.join(user_home, ".triton")
@@ -205,8 +230,14 @@ def get_thirdparty_packages(packages: list):
         if os.environ.get(p.syspath_var_name):
             package_dir = os.environ[p.syspath_var_name]
         version_file_path = os.path.join(package_dir, "version.txt")
-        if p.syspath_var_name not in os.environ and\
-           (not os.path.exists(version_file_path) or Path(version_file_path).read_text() != p.url):
+
+        input_defined = p.syspath_var_name in os.environ
+        input_exists = os.path.exists(version_file_path)
+        input_compatible = input_exists and Path(version_file_path).read_text() == p.url
+
+        if is_offline_build() and not input_defined:
+            raise RuntimeError(f"Requested an offline build but {p.syspath_var_name} is not set")
+        if not is_offline_build() and not input_defined and not input_compatible:
             with contextlib.suppress(Exception):
                 shutil.rmtree(package_root_dir)
             os.makedirs(package_root_dir, exist_ok=True)
@@ -229,16 +260,23 @@ def get_thirdparty_packages(packages: list):
     return thirdparty_cmake_args
 
 
-def download_and_copy(name, src_path, variable, version, url_func):
+def download_and_copy(name, src_path, dst_path, variable, version, url_func):
+    if is_offline_build():
+        return
     triton_cache_path = get_triton_cache_path()
     if variable in os.environ:
         return
     base_dir = os.path.dirname(__file__)
     system = platform.system()
-    arch = {"x86_64": "64", "arm64": "aarch64", "aarch64": "aarch64"}[platform.machine()]
+    try:
+        arch = {"x86_64": "64", "arm64": "aarch64", "aarch64": "aarch64"}[platform.machine()]
+    except KeyError:
+        arch = platform.machine()
     url = url_func(arch, version)
     tmp_path = os.path.join(triton_cache_path, "nvidia", name)  # path to cache the download
-    dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", src_path)  # final binary path
+    dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", dst_path)  # final binary path
+    platform_name = "sbsa-linux" if arch == "aarch64" else "x86_64-linux"
+    src_path = src_path(platform_name, version) if callable(src_path) else src_path
     src_path = os.path.join(tmp_path, src_path)
     download = not os.path.exists(src_path)
     if os.path.exists(dst_path) and system == "Linux" and shutil.which(dst_path) is not None:
@@ -322,19 +360,37 @@ class CMakeBuild(build_ext):
         for ext in self.extensions:
             self.build_extension(ext)
 
+    def get_pybind11_cmake_args(self):
+        pybind11_sys_path = get_env_with_keys(["PYBIND11_SYSPATH"])
+        if pybind11_sys_path:
+            pybind11_include_dir = os.path.join(pybind11_sys_path, "include")
+        else:
+            pybind11_include_dir = pybind11.get_include()
+        return [f"-DPYBIND11_INCLUDE_DIR={pybind11_include_dir}"]
+
     def get_proton_cmake_args(self):
-        cmake_args = get_thirdparty_packages([get_json_package_info(), get_pybind11_package_info()])
-        cupti_include_dir = get_env_with_keys(["CUPTI_INCLUDE_PATH"])
+        cmake_args = get_thirdparty_packages([get_json_package_info()])
+        cmake_args += self.get_pybind11_cmake_args()
+        cupti_include_dir = get_env_with_keys(["TRITON_CUPTI_INCLUDE_PATH"])
         if cupti_include_dir == "":
             cupti_include_dir = os.path.join(get_base_dir(), "third_party", "nvidia", "backend", "include")
         cmake_args += ["-DCUPTI_INCLUDE_DIR=" + cupti_include_dir]
+        cupti_lib_dir = get_env_with_keys(["TRITON_CUPTI_LIB_PATH"])
+        if cupti_lib_dir == "":
+            cupti_lib_dir = os.path.join(get_base_dir(), "third_party", "nvidia", "backend", "lib", "cupti")
+        cmake_args += ["-DCUPTI_LIB_DIR=" + cupti_lib_dir]
+        roctracer_include_dir = get_env_with_keys(["ROCTRACER_INCLUDE_PATH"])
+        if roctracer_include_dir == "":
+            roctracer_include_dir = os.path.join(get_base_dir(), "third_party", "amd", "backend", "include")
+        cmake_args += ["-DROCTRACER_INCLUDE_DIR=" + roctracer_include_dir]
         return cmake_args
 
     def build_extension(self, ext):
         lit_dir = shutil.which('lit')
         ninja_dir = shutil.which('ninja')
         # lit is used by the test suite
-        thirdparty_cmake_args = get_thirdparty_packages([get_pybind11_package_info(), get_llvm_package_info()])
+        thirdparty_cmake_args = get_thirdparty_packages([get_llvm_package_info()])
+        thirdparty_cmake_args += self.get_pybind11_cmake_args()
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.path)))
         # create build directories
         if not os.path.exists(self.build_temp):
@@ -398,7 +454,18 @@ class CMakeBuild(build_ext):
                 "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
             ]
 
-        cmake_args += self.get_proton_cmake_args()
+        if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+            cmake_args += self.get_proton_cmake_args()
+        else:
+            cmake_args += ["-DTRITON_BUILD_PROTON=OFF"]
+
+        if is_offline_build():
+            # unit test builds fetch googletests from GitHub
+            cmake_args += ["-DTRITON_BUILD_UT=OFF"]
+
+        cmake_args_append = os.getenv("TRITON_APPEND_CMAKE_ARGS")
+        if cmake_args_append is not None:
+            cmake_args += shlex.split(cmake_args_append)
 
         env = os.environ.copy()
         cmake_dir = get_cmake_dir()
@@ -407,58 +474,76 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-nvidia_version_path = os.path.join(get_base_dir(), "cmake", "nvidia-toolchain-version.txt")
+nvidia_version_path = os.path.join(get_base_dir(), "cmake", "nvidia-toolchain-version.json")
 with open(nvidia_version_path, "r") as nvidia_version_file:
-    NVIDIA_TOOLCHAIN_VERSION = nvidia_version_file.read().strip()
+    # parse this json file to get the version of the nvidia toolchain
+    NVIDIA_TOOLCHAIN_VERSION = json.load(nvidia_version_file)
+
+
+def get_platform_dependent_src_path(subdir):
+    return lambda platform, version: (
+        (lambda version_major, version_minor1, version_minor2, : f"targets/{platform}/{subdir}"
+         if int(version_major) >= 12 and int(version_minor1) >= 5 else subdir)(*version.split('.')))
+
 
 download_and_copy(
-    name="ptxas",
-    src_path="bin/ptxas",
-    variable="TRITON_PTXAS_PATH",
-    version=NVIDIA_TOOLCHAIN_VERSION,
-    url_func=lambda arch, version:
-    f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/linux-{arch}/cuda-nvcc-{version}-0.tar.bz2",
-)
+    name="ptxas", src_path="bin/ptxas", dst_path="bin/ptxas", variable="TRITON_PTXAS_PATH",
+    version=NVIDIA_TOOLCHAIN_VERSION["ptxas"], url_func=lambda arch, version:
+    ((lambda version_major, version_minor1, version_minor2:
+      f"https://anaconda.org/nvidia/cuda-nvcc-tools/{version}/download/linux-{arch}/cuda-nvcc-tools-{version}-0.tar.bz2"
+      if int(version_major) >= 12 and int(version_minor1) >= 5 else
+      f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/linux-{arch}/cuda-nvcc-{version}-0.tar.bz2")
+     (*version.split('.'))))
 download_and_copy(
     name="cuobjdump",
     src_path="bin/cuobjdump",
+    dst_path="bin/cuobjdump",
     variable="TRITON_CUOBJDUMP_PATH",
-    version=NVIDIA_TOOLCHAIN_VERSION,
+    version=NVIDIA_TOOLCHAIN_VERSION["cuobjdump"],
     url_func=lambda arch, version:
     f"https://anaconda.org/nvidia/cuda-cuobjdump/{version}/download/linux-{arch}/cuda-cuobjdump-{version}-0.tar.bz2",
 )
 download_and_copy(
     name="nvdisasm",
     src_path="bin/nvdisasm",
+    dst_path="bin/nvdisasm",
     variable="TRITON_NVDISASM_PATH",
-    version=NVIDIA_TOOLCHAIN_VERSION,
+    version=NVIDIA_TOOLCHAIN_VERSION["nvdisasm"],
     url_func=lambda arch, version:
     f"https://anaconda.org/nvidia/cuda-nvdisasm/{version}/download/linux-{arch}/cuda-nvdisasm-{version}-0.tar.bz2",
 )
 download_and_copy(
-    name="cudacrt",
-    src_path="include",
-    variable="TRITON_CUDACRT_PATH",
-    version=NVIDIA_TOOLCHAIN_VERSION,
-    url_func=lambda arch, version:
-    f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/linux-{arch}/cuda-nvcc-{version}-0.tar.bz2",
-)
+    name="cudacrt", src_path=get_platform_dependent_src_path("include"), dst_path="include",
+    variable="TRITON_CUDACRT_PATH", version=NVIDIA_TOOLCHAIN_VERSION["cudacrt"], url_func=lambda arch, version:
+    ((lambda version_major, version_minor1, version_minor2:
+      f"https://anaconda.org/nvidia/cuda-crt-dev_linux-{arch}/{version}/download/noarch/cuda-crt-dev_linux-{arch}-{version}-0.tar.bz2"
+      if int(version_major) >= 12 and int(version_minor1) >= 5 else
+      f"https://anaconda.org/nvidia/cuda-nvcc/{version}/download/linux-{arch}/cuda-nvcc-{version}-0.tar.bz2")
+     (*version.split('.'))))
 download_and_copy(
-    name="cudart",
-    src_path="include",
-    variable="TRITON_CUDART_PATH",
-    version=NVIDIA_TOOLCHAIN_VERSION,
-    url_func=lambda arch, version:
-    f"https://anaconda.org/nvidia/cuda-cudart-dev/{version}/download/linux-{arch}/cuda-cudart-dev-{version}-0.tar.bz2",
-)
+    name="cudart", src_path=get_platform_dependent_src_path("include"), dst_path="include",
+    variable="TRITON_CUDART_PATH", version=NVIDIA_TOOLCHAIN_VERSION["cudart"], url_func=lambda arch, version:
+    ((lambda version_major, version_minor1, version_minor2:
+      f"https://anaconda.org/nvidia/cuda-cudart-dev_linux-{arch}/{version}/download/noarch/cuda-cudart-dev_linux-{arch}-{version}-0.tar.bz2"
+      if int(version_major) >= 12 and int(version_minor1) >= 5 else
+      f"https://anaconda.org/nvidia/cuda-cudart-dev/{version}/download/linux-{arch}/cuda-cudart-dev-{version}-0.tar.bz2"
+      )(*version.split('.'))))
 download_and_copy(
-    name="cupti",
-    src_path="include",
-    variable="TRITON_CUPTI_PATH",
-    version=NVIDIA_TOOLCHAIN_VERSION,
-    url_func=lambda arch, version:
-    f"https://anaconda.org/nvidia/cuda-cupti/{version}/download/linux-{arch}/cuda-cupti-{version}-0.tar.bz2",
-)
+    name="cupti", src_path=get_platform_dependent_src_path("include"), dst_path="include",
+    variable="TRITON_CUPTI_INCLUDE_PATH", version=NVIDIA_TOOLCHAIN_VERSION["cupti"], url_func=lambda arch, version:
+    ((lambda version_major, version_minor1, version_minor2:
+      f"https://anaconda.org/nvidia/cuda-cupti-dev/{version}/download/linux-{arch}/cuda-cupti-dev-{version}-0.tar.bz2"
+      if int(version_major) >= 12 and int(version_minor1) >= 5 else
+      f"https://anaconda.org/nvidia/cuda-cupti/{version}/download/linux-{arch}/cuda-cupti-{version}-0.tar.bz2")
+     (*version.split('.'))))
+download_and_copy(
+    name="cupti", src_path=get_platform_dependent_src_path("lib"), dst_path="lib/cupti",
+    variable="TRITON_CUPTI_LIB_PATH", version=NVIDIA_TOOLCHAIN_VERSION["cupti"], url_func=lambda arch, version:
+    ((lambda version_major, version_minor1, version_minor2:
+      f"https://anaconda.org/nvidia/cuda-cupti-dev/{version}/download/linux-{arch}/cuda-cupti-dev-{version}-0.tar.bz2"
+      if int(version_major) >= 12 and int(version_minor1) >= 5 else
+      f"https://anaconda.org/nvidia/cuda-cupti/{version}/download/linux-{arch}/cuda-cupti-{version}-0.tar.bz2")
+     (*version.split('.'))))
 
 backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
 
@@ -484,7 +569,8 @@ def add_link_to_proton():
 
 def add_links():
     add_link_to_backends()
-    add_link_to_proton()
+    if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+        add_link_to_proton()
 
 
 class plugin_install(install):
@@ -530,25 +616,25 @@ def get_packages():
         "triton/language",
         "triton/language/extra",
         "triton/language/extra/cuda",
-        "triton/ops",
-        "triton/ops/blocksparse",
+        "triton/language/extra/hip",
         "triton/runtime",
         "triton/backends",
         "triton/tools",
     ]
     packages += [f'triton/backends/{backend.name}' for backend in backends]
-    packages += ["triton/profiler"]
+    if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+        packages += ["triton/profiler"]
     return packages
 
 
 def get_entry_points():
-    entry_points = {"console_scripts": ["proton-viewer = triton.profiler.viewer:main"]}
+    entry_points = {}
+    if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
+        entry_points["console_scripts"] = [
+            "proton-viewer = triton.profiler.viewer:main",
+            "proton = triton.profiler.proton:main",
+        ]
     return entry_points
-
-
-def get_install_requires():
-    install_requires = ["filelock", "llnl-hatchet"]
-    return install_requires
 
 
 setup(
@@ -560,7 +646,6 @@ setup(
     long_description="",
     packages=get_packages(),
     entry_points=get_entry_points(),
-    install_requires=get_install_requires(),
     package_data=package_data,
     include_package_data=True,
     # ext_modules=[CMakeExtension("triton", "triton/_C/")],
@@ -576,7 +661,7 @@ setup(
     zip_safe=False,
     # for PyPI
     keywords=["Compiler", "Deep Learning"],
-    url="https://github.com/openai/triton/",
+    url="https://github.com/triton-lang/triton/",
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
@@ -601,6 +686,7 @@ setup(
             "numpy",
             "pytest",
             "scipy>=1.7.1",
+            "llnl-hatchet",
         ],
         "tutorials": [
             "matplotlib",

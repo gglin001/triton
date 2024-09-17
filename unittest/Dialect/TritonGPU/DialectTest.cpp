@@ -1,11 +1,16 @@
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "mlir/AsmParser/AsmParser.h"
-#include "triton/Dialect/Triton/IR/Utility.h"
 #include <algorithm>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <random>
 
+#include "mlir/AsmParser/AsmParser.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/StrUtil.h"
+#include "llvm/Support/Signals.h"
+
 namespace {
+
 template <typename T> std::string stringifyLLVMType(const T &t) {
   std::string str;
   llvm::raw_string_ostream ros(str);
@@ -119,15 +124,15 @@ std::string multiIdxsToString(ArrayRef<std::unique_ptr<MultiIdx>> idxs) {
   for (const auto &idxPtr : idxs) {
     const MultiIdx &idx = *idxPtr;
     ss //
-        << "  [" << join(idx.idx, ",") << "] (" << idx.flatIdx << ") "
-        << "elem=[" << join(idx.idxInThread, ",") << "] ("
+        << "  [" << triton::join(idx.idx, ",") << "] (" << idx.flatIdx << ") "
+        << "elem=[" << triton::join(idx.idxInThread, ",") << "] ("
         << idx.flatIdxInThread << ") "
-        << "thread=[" << join(idx.idxInWarp, ",") << "] (" << idx.flatIdxInWarp
-        << ") "
-        << "warp=[" << join(idx.idxInCTA, ",") << "] (" << idx.flatIdxInCTA
-        << ") "
-        << "outer=[" << join(idx.idxOuter, ",") << "] (" << idx.flatIdxOuter
-        << ")\n";
+        << "thread=[" << triton::join(idx.idxInWarp, ",") << "] ("
+        << idx.flatIdxInWarp << ") "
+        << "warp=[" << triton::join(idx.idxInCTA, ",") << "] ("
+        << idx.flatIdxInCTA << ") "
+        << "outer=[" << triton::join(idx.idxOuter, ",") << "] ("
+        << idx.flatIdxOuter << ")\n";
   }
   return ss.str();
 }
@@ -283,15 +288,17 @@ void testReshape(RankedTensorType srcTy, RankedTensorType dstTy,
         dstTy.getShape(), inferredEnc, srcTy.getShape(), inferredSrcEnc,
         UnknownLoc::get(ctx));
     EXPECT_TRUE(succeeded(result))
-        << "Inverse encoding inference (" << join(dstTy.getShape(), "x") << " "
-        << stringifyLLVMType(inferredEnc) << " -> "
-        << join(srcTy.getShape(), "x") << "failed:\n"
+        << "Inverse encoding inference (" << triton::join(dstTy.getShape(), "x")
+        << " " << stringifyLLVMType(inferredEnc) << " -> "
+        << triton::join(srcTy.getShape(), "x") << "failed:\n"
         << join(diags, "\n");
     if (succeeded(result)) {
       EXPECT_EQ(inferredSrcEnc, srcTy.getEncoding())
-          << "Inverse encoding inference (" << join(dstTy.getShape(), "x")
-          << " " << stringifyLLVMType(inferredEnc) << " -> "
-          << join(srcTy.getShape(), "x") << " gave the wrong result.  Expected "
+          << "Inverse encoding inference ("
+          << triton::join(dstTy.getShape(), "x") << " "
+          << stringifyLLVMType(inferredEnc) << " -> "
+          << triton::join(srcTy.getShape(), "x")
+          << " gave the wrong result.  Expected "
           << stringifyLLVMType(srcTy.getEncoding()) << " but got "
           << stringifyLLVMType(inferredSrcEnc) << ".\n";
     }
@@ -316,9 +323,9 @@ void testReshape(RankedTensorType srcTy, RankedTensorType dstTy,
     SCOPED_TRACE(longErrors ? "src indices:\n" + multiIdxsToString(srcMultiIdxs)
                             : "");
     ADD_FAILURE() << "Reified indices do not match for encodings:\n"
-                  << "  src: [" << join(srcTy.getShape(), "x") << "] "
+                  << "  src: [" << triton::join(srcTy.getShape(), "x") << "] "
                   << stringifyLLVMType(srcTy.getEncoding()) << "\n"
-                  << "  dst: [" << join(dstTy.getShape(), "x") << "] "
+                  << "  dst: [" << triton::join(dstTy.getShape(), "x") << "] "
                   << stringifyLLVMType(inferredEnc);
   } else {
     *couldReshape = true;
@@ -513,5 +520,79 @@ TEST_F(InferLayoutTest, FuzzReshape) {
          100.0 * numSuccess / numTests);
 }
 
+class AMDMfmaLayoutTest : public ::testing::Test {
+public:
+  AMDMfmaLayoutTest() {
+    ctx.getOrLoadDialect<TritonGPUDialect>();
+    ctaLayout =
+        triton::gpu::CTALayoutAttr::get(&ctx, ctaPerCGA, ctaSplit, ctaOrder);
+    f16Ty = FloatType::getF16(&ctx);
+  }
+
+  triton::gpu::AMDMfmaEncodingAttr createMFMA(int mDim, int nDim,
+                                              ArrayRef<unsigned> warpsPerCTA) {
+    return triton::gpu::AMDMfmaEncodingAttr::get(
+        &ctx, /*versionMajor=*/2, /*versionMinor=*/0, warpsPerCTA, mDim, nDim,
+        /*isTransposed=*/false, ctaLayout);
+  }
+
+  triton::gpu::AMDMfmaEncodingAttr
+  createTransposedMFMA(int mDim, int nDim, ArrayRef<unsigned> warpsPerCTA) {
+    return triton::gpu::AMDMfmaEncodingAttr::get(
+        &ctx, /*versionMajor=*/2, /*versionMinor=*/0, warpsPerCTA, mDim, nDim,
+        /*isTransposed=*/true, ctaLayout);
+  }
+
+protected:
+  MLIRContext ctx;
+  const SmallVector<unsigned> ctaPerCGA{1, 1, 1};
+  const SmallVector<unsigned> ctaSplit{1, 1, 1};
+  const SmallVector<unsigned> ctaOrder{2, 1, 0};
+  triton::gpu::CTALayoutAttr ctaLayout;
+  Type f16Ty;
+};
+
+TEST_F(AMDMfmaLayoutTest, mfma32) {
+  auto mfma2d = createMFMA(32, 32, {2, 4});
+  ASSERT_THAT(mfma2d.getThreadOrder(), testing::ElementsAre(1u, 0u));
+  ASSERT_THAT(mfma2d.getWarpOrder(), testing::ElementsAre(1u, 0u));
+
+  auto tmfma2d = createTransposedMFMA(32, 32, {2, 4});
+  ASSERT_THAT(tmfma2d.getThreadOrder(), testing::ElementsAre(0u, 1u));
+  ASSERT_THAT(tmfma2d.getWarpOrder(), testing::ElementsAre(0u, 1u));
+
+  auto mfma3d = createMFMA(32, 32, {2, 4, 1});
+  ASSERT_THAT(mfma3d.getThreadOrder(), testing::ElementsAre(2u, 1u, 0u));
+  ASSERT_THAT(mfma3d.getWarpOrder(), testing::ElementsAre(2u, 1u, 0u));
+
+  auto tmfma3d = createTransposedMFMA(32, 32, {2, 4, 1});
+  ASSERT_THAT(tmfma3d.getThreadOrder(), testing::ElementsAre(1u, 2u, 0u));
+  ASSERT_THAT(tmfma3d.getWarpOrder(), testing::ElementsAre(1u, 2u, 0u));
+}
+
+TEST_F(AMDMfmaLayoutTest, mfma16) {
+  auto mfma2d = createMFMA(16, 16, {2, 4});
+  ASSERT_THAT(mfma2d.getThreadOrder(), testing::ElementsAre(1u, 0u));
+  ASSERT_THAT(mfma2d.getWarpOrder(), testing::ElementsAre(1u, 0u));
+
+  auto tmfma2d = createTransposedMFMA(16, 16, {2, 4});
+  ASSERT_THAT(tmfma2d.getThreadOrder(), testing::ElementsAre(0u, 1u));
+  ASSERT_THAT(tmfma2d.getWarpOrder(), testing::ElementsAre(0u, 1u));
+
+  auto mfma3d = createMFMA(16, 16, {2, 4, 1});
+  ASSERT_THAT(mfma3d.getThreadOrder(), testing::ElementsAre(2u, 1u, 0u));
+  ASSERT_THAT(mfma3d.getWarpOrder(), testing::ElementsAre(2u, 1u, 0u));
+
+  auto tmfma3d = createTransposedMFMA(16, 16, {2, 4, 1});
+  ASSERT_THAT(tmfma3d.getThreadOrder(), testing::ElementsAre(1u, 2u, 0u));
+  ASSERT_THAT(tmfma3d.getWarpOrder(), testing::ElementsAre(1u, 2u, 0u));
+}
+
 } // anonymous namespace
 } // namespace mlir::triton::gpu
+
+int main(int argc, char *argv[]) {
+  llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

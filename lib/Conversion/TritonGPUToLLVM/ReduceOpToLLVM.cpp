@@ -4,6 +4,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include <vector>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -48,7 +49,7 @@ public:
     }
 
     // Compute a shared memory base per operand.
-    auto smemShape = helper.getScratchConfig();
+    auto smemShape = helper.getScratchRepShape();
 
     SmallVector<Value> smemBases =
         getSmemBases(op, product<unsigned>(smemShape), rewriter);
@@ -144,15 +145,24 @@ private:
     triton::ReduceOp op = helper.getOperation();
     RankedTensorType operandType = op.getInputTypes()[0];
     // Assumes offsets don't actually depend on type
-    SmallVector<SmallVector<unsigned>> offset =
+    SmallVector<SmallVector<unsigned>> offsets =
         emitOffsetForLayout(helper.getSrcLayout(), operandType);
+
+    // Thread X might hold the same input value in two registers.  Get the
+    // indices in `offsets` that hold unique values, and only accumualte over
+    // those.
+    llvm::MapVector<ArrayRef<unsigned>, int> uniqueOffsets;
+    for (int i = 0; i < offsets.size(); ++i) {
+      uniqueOffsets.insert({offsets[i], i});
+    }
+
     unsigned srcElems = getTotalElemsPerThread(operandType);
     auto *combineOp = &op.getCombineOp();
     auto srcIndices = emitIndices(op.getLoc(), rewriter, targetInfo,
                                   helper.getSrcLayout(), operandType, true);
     // reduce within threads
-    for (unsigned i = 0; i < srcElems; ++i) {
-      SmallVector<unsigned> key = offset[i];
+    for (const auto &[_, i] : uniqueOffsets) {
+      SmallVector<unsigned> key = offsets[i];
       key[op.getAxis()] = 0;
       bool isFirst = accs.find(key) == accs.end();
       accumulate(rewriter, *combineOp, accs[key], srcValues[i], isFirst);
@@ -166,8 +176,8 @@ private:
   void warpReduce(ConversionPatternRewriter &rewriter, Location loc,
                   SmallVector<Value> &acc, triton::ReduceOp op,
                   unsigned numLaneToReduce, unsigned interleave) const {
-    auto success =
-        targetInfo.warpReduce(rewriter, loc, acc, op, numLaneToReduce);
+    auto success = targetInfo.warpReduce(rewriter, loc, acc, op,
+                                         numLaneToReduce, interleave);
     if (success)
       return;
     for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {
@@ -230,7 +240,7 @@ private:
                     ConversionPatternRewriter &rewriter) const {
     auto srcLayout = helper.getSrcLayout();
     auto srcShape = helper.getSrcShape();
-    auto order = getOrder(srcLayout);
+    auto order = triton::gpu::getWarpOrder(srcLayout);
     SmallVector<Value> multiDimWarpId;
 
     // 2x2 warps with slice dim = 0, warpId = 2 ends up writing at the same
@@ -239,7 +249,7 @@ private:
     if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(srcLayout)) {
       auto parentLayout = sliceLayout.getParent();
       auto parentWarpsPerCTA = triton::gpu::getWarpsPerCTA(parentLayout);
-      auto parentOrder = triton::gpu::getOrder(parentLayout);
+      auto parentOrder = triton::gpu::getWarpOrder(parentLayout);
       multiDimWarpId =
           delinearize(rewriter, loc, warpId, parentWarpsPerCTA, parentOrder);
       multiDimWarpId.erase(multiDimWarpId.begin() + sliceLayout.getDim());
@@ -268,7 +278,7 @@ private:
     Value laneId = urem(threadId, warpSize);
     auto srcShape = helper.getSrcShape();
     unsigned axis = op.getAxis();
-    auto smemShape = helper.getScratchConfig();
+    auto smemShape = helper.getScratchRepShape();
 
     auto threadsPerWarp =
         triton::gpu::getThreadsPerWarpWithUniqueData(srcLayout, srcShape);
@@ -308,7 +318,7 @@ private:
                                    ConversionPatternRewriter &rewriter) const {
     triton::ReduceOp op = helper.getOperation();
     auto srcLayout = helper.getSrcLayout();
-    auto smemShape = helper.getScratchConfig();
+    auto smemShape = helper.getScratchRepShape();
     unsigned elems = product<unsigned>(smemShape);
     unsigned sizeInterWarps = helper.getInterWarpSizeWithUniqueData();
     Location loc = op.getLoc();
@@ -331,8 +341,8 @@ private:
         auto elemTy = getElementType(op, i);
         Value readPtr = gep(ptr_ty(rewriter.getContext(), 3), elemTy,
                             smemBases[i], readOffset);
-        acc[i] = targetInfo.loadShared(rewriter, loc, getTypeConverter(),
-                                       readPtr, elemTy, threadIsNeeded);
+        acc[i] = targetInfo.loadShared(rewriter, loc, readPtr, elemTy,
+                                       threadIsNeeded);
       }
       warpReduce(rewriter, loc, acc, op, sizeInterWarps, 1 /* interleave */);
       // only the first thread in each sizeInterWarps is writing

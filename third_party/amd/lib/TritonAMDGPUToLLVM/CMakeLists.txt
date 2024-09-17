@@ -15,6 +15,8 @@ add_triton_library(TritonAMDGPUToLLVM
     TargetInfo.cpp
     TargetUtils.cpp
     DecomposeUnsupportedConversions.cpp
+    OptimizeLDSUsage.cpp
+    OptimizeLDSUtility.cpp
     SPMDOpToLLVM.cpp
 
     DEPENDS
@@ -23,5 +25,3 @@ add_triton_library(TritonAMDGPUToLLVM
     LINK_LIBS PUBLIC
     TritonGPUToLLVM
 )
-
-target_compile_definitions(TritonAMDGPUToLLVM PUBLIC USE_ROCM)
