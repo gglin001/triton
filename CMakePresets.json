@@ -15,7 +15,6 @@
         "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/bin",
         "LLVM_DIR": "${sourceDir}/../llvm-project/build/install/lib/cmake/llvm",
         "MLIR_DIR": "${sourceDir}/../llvm-project/build/install/lib/cmake/mlir",
-        "LLVM_LIBRARY_DIR": "${sourceDir}/../llvm-project/build/install/lib/cmake/llvm",
         "TRITON_BUILD_PYTHON_MODULE": true,
         "TRITON_BUILD_PROTON": false,
         "TRITON_BUILD_UT": false,
