@@ -2,8 +2,7 @@
   "version": 2,
   "configurePresets": [
     {
-      "name": "iree_llvm",
-      "description": "for iree_llvm docker env",
+      "name": "osx",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
@@ -14,15 +13,15 @@
         "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
         "CMAKE_INSTALL_RPATH_USE_LINK_PATH": true,
         "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/bin",
-        "LLVM_DIR": "/iree-llvm-project/build/install/lib/cmake/llvm",
-        "MLIR_DIR": "/iree-llvm-project/build/install/lib/cmake/mlir",
-        "LLVM_LIBRARY_DIR": "/iree-llvm-project/build/install/lib/cmake/llvm",
-        "TRITON_BUILD_PYTHON_MODULE": false,
+        "LLVM_DIR": "${sourceDir}/../llvm-project/build/install/lib/cmake/llvm",
+        "MLIR_DIR": "${sourceDir}/../llvm-project/build/install/lib/cmake/mlir",
+        "LLVM_LIBRARY_DIR": "${sourceDir}/../llvm-project/build/install/lib/cmake/llvm",
+        "TRITON_BUILD_PYTHON_MODULE": true,
         "TRITON_BUILD_PROTON": false,
         "TRITON_BUILD_UT": false,
         "TRITON_CODEGEN_BACKENDS": "nvidia;amd",
-        "LLVM_ENABLE_ASSERTIONS": true,
-        "UNUSED": "UNUSED"
+        "Python3_EXECUTABLE": "/Users/allen/micromamba/envs/pyenv/bin/python",
+        "LLVM_ENABLE_ASSERTIONS": true
       }
     }
   ]

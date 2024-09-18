@@ -8,11 +8,13 @@ popd
 ###############################################################################
 
 # "TRITON_PLUGIN_DIRS": "${sourceDir}/triton-shared",
-git clone git@github.com:microsoft/triton-shared.git
+# git clone git@github.com:microsoft/triton-shared.git
 
-# build & install targets with cmake(cmake presets) in vscode
-# cmake --preset iree_llvm
-cmake --preset iree_llvm_allen
+###############################################################################
+
+# cmake --preset osx
+cmake --preset osx_allen
+
 cmake --build $PWD/build --target all
 
 ###############################################################################
