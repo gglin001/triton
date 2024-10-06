@@ -30,6 +30,7 @@ def builtin(fn: T) -> T:
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if "_builder" not in kwargs or kwargs["_builder"] is None:
+            print(kwargs)
             raise ValueError("Did you forget to add @triton.jit ? "
                              "(`_builder` argument must be provided outside of JIT functions.)")
         return fn(*args, **kwargs)
@@ -440,6 +441,20 @@ class dtype:
             assert self.is_floating()
             return dtype.KIND.FLOATING
 
+    def get_int_max_value(self):
+        if self.is_int_signed():
+            return 2**(self.int_bitwidth - 1) - 1
+        if self.is_int_unsigned():
+            return 2**self.int_bitwidth - 1
+        assert False
+
+    def get_int_min_value(self):
+        if self.is_int_signed():
+            return -2**(self.int_bitwidth - 1)
+        if self.is_int_unsigned():
+            return 0
+        assert False
+
     @staticmethod
     def is_dtype(type_str):
         return type_str in dtype.SINT_TYPES + dtype.UINT_TYPES + dtype.FP_TYPES + dtype.OTHER_TYPES
@@ -701,12 +716,20 @@ def get_int_dtype(bitwidth: int, signed: bool) -> dtype:
         raise ValueError(f'Unsupported bitwidth {bitwidth} and signedness {signed}')
 
 
+class _value:
+    """Base class of values that exist in the triton IR (i.e. not constexprs).
+    """
+
+    def __init__(self, handle):
+        self.handle = handle
+
+
 # -----------------------
 # tensor
 # -----------------------
 
 
-class tensor:
+class tensor(_value):
     """Represents an N-dimensional array of values or pointers.
 
     :code:`tensor` is the fundamental data structure in Triton programs.  Most
@@ -729,7 +752,7 @@ class tensor:
     def __init__(self, handle, type: dtype):
         """Not called by user code."""
         # IR handle
-        self.handle = handle
+        super().__init__(handle)
         # Block shape
         self.shape = type.shape if type.is_block() else ()
         self.numel = 1
@@ -747,31 +770,27 @@ class tensor:
 
     @builtin
     def __add__(self, other, _builder=None):
-        other = _unwrap_if_constexpr(other)
-        return semantic.add(self, other, _builder)
+        return add(self, other, sanitize_overflow=True, _builder=_builder)
 
     @builtin
     def __radd__(self, other, _builder=None):
-        return self.__add__(other, _builder=_builder)
+        return add(other, self, sanitize_overflow=True, _builder=_builder)
 
     @builtin
     def __sub__(self, other, _builder=None):
-        other = _unwrap_if_constexpr(other)
-        return semantic.sub(self, other, _builder)
+        return sub(self, other, sanitize_overflow=True, _builder=_builder)
 
     @builtin
     def __rsub__(self, other, _builder=None):
-        other = _unwrap_if_constexpr(other)
-        return semantic.sub(other, self, _builder)
+        return sub(other, self, sanitize_overflow=True, _builder=_builder)
 
     @builtin
     def __mul__(self, other, _builder=None):
-        other = _unwrap_if_constexpr(other)
-        return semantic.mul(self, other, _builder)
+        return mul(self, other, sanitize_overflow=True, _builder=_builder)
 
     @builtin
     def __rmul__(self, other, _builder=None):
-        return self.__mul__(other, _builder=_builder)
+        return mul(other, self, sanitize_overflow=True, _builder=_builder)
 
     @builtin
     def __truediv__(self, other, _builder=None):
@@ -1613,7 +1632,7 @@ def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, _builder=
 
     This loads a tensor of data based on the descriptor and offsets.
     """
-    type = block_type(dtype, shape)
+    type = block_type(_constexpr_to_value(dtype), shape)
     return semantic.descriptor_load(desc_pointer, offsets, "", "", type, _builder)
 
 
@@ -1861,6 +1880,33 @@ def where(condition, x, y, _builder=None):
 # -----------------------
 # Math
 # -----------------------
+
+
+@builtin
+def add(x, y, sanitize_overflow: constexpr = True, _builder=None):
+    x = _unwrap_if_constexpr(x)
+    y = _unwrap_if_constexpr(y)
+    x = semantic.to_tensor(x, _builder)
+    y = semantic.to_tensor(y, _builder)
+    return semantic.add(x, y, sanitize_overflow, _builder)
+
+
+@builtin
+def sub(x, y, sanitize_overflow: constexpr = True, _builder=None):
+    x = _unwrap_if_constexpr(x)
+    y = _unwrap_if_constexpr(y)
+    x = semantic.to_tensor(x, _builder)
+    y = semantic.to_tensor(y, _builder)
+    return semantic.sub(x, y, sanitize_overflow, _builder)
+
+
+@builtin
+def mul(x, y, sanitize_overflow: constexpr = True, _builder=None):
+    x = _unwrap_if_constexpr(x)
+    y = _unwrap_if_constexpr(y)
+    x = semantic.to_tensor(x, _builder)
+    y = semantic.to_tensor(y, _builder)
+    return semantic.mul(x, y, sanitize_overflow, _builder)
 
 
 @builtin
@@ -2308,25 +2354,7 @@ def device_assert(cond, msg="", _builder=None):
     :param msg: the message to print if the assertion fails. This is required to be a string literal.
     '''
     msg = _constexpr_to_value(msg)
-    import inspect
-    frame = inspect.currentframe()
-    module = inspect.getmodule(frame)
-    # The triton function module doesn't have the name attribute.
-    # We use this trick to find the caller.
-    while hasattr(module, "__name__"):
-        frame = frame.f_back
-        module = inspect.getmodule(frame)
-    lineno = 0
-    func_name = 'unknown'
-    file_name = 'unknown'
-    if frame is not None and frame.f_back is not None:
-        func_name = frame.f_code.co_name
-        file_name = frame.f_back.f_code.co_filename
-        # TODO: The line number currently indicates the line
-        # where the triton function is called but not where the
-        # device_assert is called. Need to enhance this.
-        lineno = frame.f_back.f_lineno
-    return semantic.device_assert(semantic.to_tensor(cond, _builder), msg, file_name, func_name, lineno, _builder)
+    return semantic.device_assert(semantic.to_tensor(cond, _builder), msg, _builder)
 
 
 @builtin
@@ -2528,9 +2556,12 @@ class range:
         kernel argument.  The kernel argument only pipelines loads that feed
         into :code:`dot` operations, while this attribute tries to pipeline most
         (though not all) loads in this loop.
+    :param loop_unroll_factor: Tells the Triton IR level loop unroller how many
+        times to unroll a for loop that this range is used with. Less than 2 for
+        this value implies no unrolling.
     """
 
-    def __init__(self, arg1, arg2=None, step=None, num_stages=None):
+    def __init__(self, arg1, arg2=None, step=None, num_stages=None, loop_unroll_factor=None):
         if step is None:
             self.step = constexpr(1)
         else:
@@ -2542,6 +2573,7 @@ class range:
             self.start = arg1
             self.end = arg2
         self.num_stages = num_stages
+        self.loop_unroll_factor = loop_unroll_factor
 
     def __iter__(self):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")
