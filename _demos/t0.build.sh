@@ -9,6 +9,7 @@ popd
 
 # "TRITON_PLUGIN_DIRS": "${sourceDir}/triton-shared",
 # git clone git@github.com:microsoft/triton-shared.git
+# ln -s $PWD/../triton-shared $PWD/triton-shared
 
 ###############################################################################
 
@@ -22,6 +23,8 @@ cmake --build $PWD/build --target all
 # "TRITON_BUILD_PYTHON_MODULE": true,
 rm $PWD/python/triton/_C/libtriton.so
 ln -sf $PWD/build/libtriton.so $PWD/python/triton/_C/
+ln -s $PWD/triton-shared/backend $PWD/python/triton/backends/cpu
+ln -s ~/.cache $PWD/_demos/.cache
 
 pushd python
 pip install -e . -vvv
