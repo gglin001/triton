@@ -24,7 +24,7 @@ rm $PWD/python/triton/_C/libtriton.so
 ln -sf $PWD/build/libtriton.so $PWD/python/triton/_C/
 
 pushd python
-pip install -e .
+pip install -e . -vvv
 popd
 
 python -c "import triton; print(triton.__version__)"
