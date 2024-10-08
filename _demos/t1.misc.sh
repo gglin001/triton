@@ -4,6 +4,7 @@ mkdir -p _demos/_log
 
 triton-opt --help >_demos/_log/triton-opt.help.log
 triton-llvm-opt --help >_demos/_log/triton-llvm-opt.help.log
+triton-tensor-layout --help >_demos/_log/triton-tensor-layout.help.log
 triton-reduce --help >_demos/_log/triton-reduce.help.log
 # triton-shared-opt --help >_demos/_log/triton-shared-opt.help.log
 
