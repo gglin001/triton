@@ -90,8 +90,7 @@ struct LLVMDIScopePass : public LLVMDIScopeBase<LLVMDIScopePass> {
         compileUnitAttr = LLVM::DICompileUnitAttr::get(
             distinctId, llvm::dwarf::DW_LANG_C, fileAttr,
             StringAttr::get(context, "triton"),
-            /*isOptimized=*/true, LLVM::DIEmissionKind::LineTablesOnly,
-            LLVM::DINameTableKind::Default);
+            /*isOptimized=*/true, LLVM::DIEmissionKind::LineTablesOnly);
       }
       subprogramFlags = subprogramFlags | LLVM::DISubprogramFlags::Definition;
     } else {
