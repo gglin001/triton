@@ -32,8 +32,7 @@
         "CMAKE_C_COMPILER": "llvm-dpcpp/build/bin/clang",
         "CMAKE_CXX_COMPILER": "llvm-dpcpp/build/bin/clang++",
         "LLVM_DIR": "llvm-mlir/build/lib/cmake/llvm",
-        "MLIR_DIR": "llvm-mlir/build/lib/cmake/mlir",
-        "SPIRVToLLVMTranslator_INCLUDE_DIR": "llvm-dpcpp/llvm-spirv/include"
+        "MLIR_DIR": "llvm-mlir/build/lib/cmake/mlir"
       }
     }
   ]
