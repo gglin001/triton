@@ -1664,7 +1664,13 @@ void init_triton_ir(py::module &&m) {
                auto printingFlags = OpPrintingFlags();
                printingFlags.elideLargeElementsAttrs(16);
                printingFlags.enableDebugInfo();
-               auto printAlways = [funcToDump](Pass *, Operation *op) -> bool {
+               std::string funcToDumpDir =
+                   triton::tools::getStrEnv("MLIR_ENABLE_DUMP_DIR");
+               if (funcToDumpDir.empty()) {
+                 funcToDumpDir = ".pass_manager_output";
+               }
+               auto printAlways =
+                   [funcToDump, funcToDumpDir](Pass *, Operation *op) -> bool {
                  if (funcToDump.empty())
                    return true;
                  if (auto mod = dyn_cast<mlir::ModuleOp>(op)) {
@@ -1677,6 +1683,7 @@ void init_triton_ir(py::module &&m) {
 
                  return false;
                };
+#if 0
                self.enableIRPrinting(
                    /*shouldPrintBeforePass=*/printAlways,
                    /*shouldPrintAfterPass=*/printAlways,
@@ -1684,6 +1691,15 @@ void init_triton_ir(py::module &&m) {
                    /*printAfterOnlyOnChange=*/false,
                    /*printAfterOnlyOnFailure*/ true, llvm::dbgs(),
                    printingFlags);
+#else
+               self.enableIRPrintingToFileTree(
+                   /*shouldPrintBeforePass=*/printAlways,
+                   /*shouldPrintAfterPass=*/printAlways,
+                   /*printModuleScope=*/true,
+                   /*printAfterOnlyOnChange=*/false,
+                   /*printAfterOnlyOnFailure*/ false,
+                   /*printTreeDir*/ funcToDumpDir, printingFlags);
+#endif
              }
            })
       .def("run", [](PassManager &self, ModuleOp &mod) {

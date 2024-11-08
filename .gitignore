@@ -74,3 +74,8 @@ docs/sg_execution_times.rst
 
 # macOS
 .DS_Store
+
+CMakeUserPresets.json
+CMakeUserPresets.json
+.clangd
+python/triton/_C/libtriton/
