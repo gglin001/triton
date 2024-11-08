@@ -1635,6 +1635,9 @@ void init_triton_ir(py::module &&m) {
                                                   tensorShape);
            });
 
+  // index for `MLIR_ENABLE_DUMP_DIR`
+  static int MLIR_ENABLE_DUMP_DIR_IDX = 0;
+
   py::class_<PassManager>(m, "pass_manager", py::module_local())
       .def(py::init<MLIRContext *>())
       .def("enable_debug",
@@ -1669,6 +1672,8 @@ void init_triton_ir(py::module &&m) {
                if (funcToDumpDir.empty()) {
                  funcToDumpDir = ".pass_manager_output";
                }
+               funcToDumpDir += "__" + std::to_string(MLIR_ENABLE_DUMP_DIR_IDX);
+               MLIR_ENABLE_DUMP_DIR_IDX += 1;
                auto printAlways =
                    [funcToDump, funcToDumpDir](Pass *, Operation *op) -> bool {
                  if (funcToDump.empty())
