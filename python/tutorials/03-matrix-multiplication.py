@@ -234,10 +234,10 @@ def get_autotune_config():
 #       meta-parameters (e.g., `BLOCK_SIZE_M`) and compilation options (e.g., `num_warps`) to try
 #   - An auto-tuning *key* whose change in values will trigger evaluation of all the
 #       provided configs
-@triton.autotune(
-    configs=get_autotune_config(),
-    key=['M', 'N', 'K'],
-)
+# @triton.autotune(
+#     configs=get_autotune_config(),
+#     key=['M', 'N', 'K'],
+# )
 @triton.jit
 def matmul_kernel(
         # Pointers to matrices
@@ -321,6 +321,32 @@ def matmul_kernel(
 def leaky_relu(x):
     return tl.where(x >= 0, x, 0.01 * x)
 
+# run in terminal
+"""
+mkdir -p _demos/tx.tmp
+
+python python/tutorials/03-matrix-multiplication.py 2>&1 0>&1 | tee _demos/tx.tmp/03-matrix-multiplication.log
+
+# or
+
+MLIR_ENABLE_DUMP=1 \
+  MLIR_ENABLE_DUMP_DIR="_demos/pass_manager_output_03_" \
+  python python/tutorials/03-matrix-multiplication.py 2>&1 0>&1 | tee _demos/tx.tmp/03-matrix-multiplication.log
+"""
+
+constants = {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 256,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 8,
+    "ACTIVATION": "",
+}
+# TODO: how to enable `num_warps` / `num_warps` / etc
+signature="*fp16,*fp16,*fp16,i32,i32,i32,i32,i32,i32,i32,i32,i32"
+ast = triton.compiler.ASTSource(fn=matmul_kernel, signature=signature, constants=constants)
+target = triton.backends.compiler.GPUTarget("cuda", 90, 32)
+kernel = triton.compile(ast, target=target)
+exit(0)
 
 # %%
 # We can now create a convenience wrapper function that only takes two input tensors,
