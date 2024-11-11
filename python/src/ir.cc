@@ -1669,11 +1669,11 @@ void init_triton_ir(py::module &&m) {
                printingFlags.enableDebugInfo();
                std::string funcToDumpDir =
                    triton::tools::getStrEnv("MLIR_ENABLE_DUMP_DIR");
-               if (funcToDumpDir.empty()) {
-                 funcToDumpDir = ".pass_manager_output";
+               if (!funcToDumpDir.empty()) {
+                 funcToDumpDir +=
+                     "__" + std::to_string(MLIR_ENABLE_DUMP_DIR_IDX);
+                 MLIR_ENABLE_DUMP_DIR_IDX += 1;
                }
-               funcToDumpDir += "__" + std::to_string(MLIR_ENABLE_DUMP_DIR_IDX);
-               MLIR_ENABLE_DUMP_DIR_IDX += 1;
                auto printAlways =
                    [funcToDump, funcToDumpDir](Pass *, Operation *op) -> bool {
                  if (funcToDump.empty())
@@ -1688,23 +1688,23 @@ void init_triton_ir(py::module &&m) {
 
                  return false;
                };
-#if 0
-               self.enableIRPrinting(
-                   /*shouldPrintBeforePass=*/printAlways,
-                   /*shouldPrintAfterPass=*/printAlways,
-                   /*printModuleScope=*/true,
-                   /*printAfterOnlyOnChange=*/false,
-                   /*printAfterOnlyOnFailure*/ true, llvm::dbgs(),
-                   printingFlags);
-#else
-               self.enableIRPrintingToFileTree(
-                   /*shouldPrintBeforePass=*/printAlways,
-                   /*shouldPrintAfterPass=*/printAlways,
-                   /*printModuleScope=*/true,
-                   /*printAfterOnlyOnChange=*/false,
-                   /*printAfterOnlyOnFailure*/ false,
-                   /*printTreeDir*/ funcToDumpDir, printingFlags);
-#endif
+               if (funcToDumpDir.empty()) {
+                 self.enableIRPrinting(
+                     /*shouldPrintBeforePass=*/printAlways,
+                     /*shouldPrintAfterPass=*/printAlways,
+                     /*printModuleScope=*/true,
+                     /*printAfterOnlyOnChange=*/false,
+                     /*printAfterOnlyOnFailure*/ true, llvm::dbgs(),
+                     printingFlags);
+               } else {
+                 self.enableIRPrintingToFileTree(
+                     /*shouldPrintBeforePass=*/printAlways,
+                     /*shouldPrintAfterPass=*/printAlways,
+                     /*printModuleScope=*/true,
+                     /*printAfterOnlyOnChange=*/false,
+                     /*printAfterOnlyOnFailure*/ false,
+                     /*printTreeDir*/ funcToDumpDir, printingFlags);
+               }
              }
            })
       .def("run", [](PassManager &self, ModuleOp &mod) {
