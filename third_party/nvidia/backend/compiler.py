@@ -185,9 +185,6 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttir_raw(mod, metadata, opt):
-        pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
-        pm.run(mod)
         return mod
 
     @staticmethod
