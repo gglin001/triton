@@ -344,7 +344,8 @@ constants = {
 signature="*fp16,*fp16,*fp16,i32,i32,i32,i32,i32,i32,i32,i32,i32"
 ast = triton.compiler.ASTSource(fn=matmul_kernel, signature=signature, constants=constants)
 target = triton.backends.compiler.GPUTarget("cuda", 90, 32)
-options = {"num_warps": 4, "num_stages": 2, "num_ctas": 1, "maxnreg": None}
+# options = {"num_warps": 4, "num_stages": 2, "num_ctas": 1, "maxnreg": None}
+options = {"num_warps": 4, "num_stages": 3, "num_ctas": 1, "maxnreg": None}
 kernel = triton.compile(ast, target=target, options=options)
 exit(0)
 
