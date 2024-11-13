@@ -184,6 +184,8 @@ output_triton_cpu = add_tiled(x, y, None)
 print(f'The maximum difference between torch-cpu-tiled and triton-cpu is '
       f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
 
+exit(0)
+
 LINE_VALS = [
     'triton-cpu', 'triton-cpu-hooks', 'triton-cpu-tiled', 'triton-cpu-tiled-hooks', 'triton-cpu-tiled-tuned-hooks',
     'triton-cpu-tiled-autotuned-hooks', 'torch-cpu'
