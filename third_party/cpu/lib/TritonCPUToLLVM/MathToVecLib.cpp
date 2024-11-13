@@ -389,7 +389,8 @@ struct MathToVecLibPass
     populatePatternsForOp<math::CosOp>(patterns, VecFnNameGenerator("cos"));
     populatePatternsForOp<math::CoshOp>(patterns, VecFnNameGenerator("cosh"));
     populatePatternsForOp<math::ErfOp>(patterns, VecFnNameGenerator("erf"));
-    populatePatternsForOp<math::ExpOp>(patterns, VecFnNameGenerator("exp"));
+    // no symbol `Sleef_expf16_u10` on aarch64
+    // populatePatternsForOp<math::ExpOp>(patterns, VecFnNameGenerator("exp"));
     populatePatternsForOp<math::Exp2Op>(patterns, VecFnNameGenerator("exp2"));
     populatePatternsForOp<math::LogOp>(patterns, VecFnNameGenerator("log"));
     populatePatternsForOp<math::Log2Op>(patterns, VecFnNameGenerator("log2"));

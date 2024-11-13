@@ -147,6 +147,8 @@ y_triton_cpu = softmax(x)
 y_torch_cpu = torch.softmax(x, axis=1)
 assert torch.allclose(y_triton_cpu, y_torch_cpu), (y_triton_cpu, y_torch_cpu)
 
+exit(0)
+
 LINE_VALS = [
     'triton-cpu-single',
     'triton-cpu',
