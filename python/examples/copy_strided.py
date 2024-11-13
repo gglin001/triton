@@ -22,4 +22,4 @@ src = tc.ASTSource(
 )
 
 ret = triton.compile(src)
-print(ret.asm["ttgir"])
+# print(ret.asm["ttgir"])

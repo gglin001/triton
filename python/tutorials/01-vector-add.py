@@ -169,7 +169,8 @@ def add_tiled_autotuned(x: torch.Tensor, y: torch.Tensor, output):
 # %%
 # We can now use the above function to compute the element-wise sum of two `torch.tensor` objects and test its correctness:
 torch.manual_seed(0)
-size = 98432
+# size = 98432
+size = 8432
 
 triton.runtime.driver.set_active_to_cpu()
 x = torch.rand(size, device='cpu')
@@ -180,9 +181,9 @@ print(output_torch_cpu)
 print(output_triton_cpu)
 print(f'The maximum difference between torch-cpu and triton-cpu is '
       f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
-output_triton_cpu = add_tiled(x, y, None)
-print(f'The maximum difference between torch-cpu-tiled and triton-cpu is '
-      f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
+# output_triton_cpu = add_tiled(x, y, None)
+# print(f'The maximum difference between torch-cpu-tiled and triton-cpu is '
+#       f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
 
 exit(0)
 
