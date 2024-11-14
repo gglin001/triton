@@ -64,7 +64,6 @@ public:
     addIllegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
-    addLegalOp<mlir::gpu::ThreadIdOp>();
   }
 };
 
@@ -197,6 +196,10 @@ struct ConvertTritonGPUToLLVM
         typeConverter, patterns, targetInfo, benefit);
 
     if (!disabledPatterns.empty() || !enabledPatterns.empty()) {
+      // `getThreadId`
+      convTarget.addLegalOp<mlir::gpu::ThreadIdOp>();
+      convTarget.addLegalOp<arith::IndexCastOp>();
+      // needed ?
       // convTarget.addLegalDialect<triton::TritonDialect>();
       // convTarget.addLegalDialect<triton::gpu::TritonGPUDialect>();
       // convTarget.addLegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
