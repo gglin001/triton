@@ -1,2 +1,2 @@
-run.sh.log
-graph.mlir.opt.mlir
+*.log
+*.opt.mlir

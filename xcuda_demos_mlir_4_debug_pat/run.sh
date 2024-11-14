@@ -23,6 +23,7 @@ args=(
   #
   # --allocate-shared-memory
   #
+  # --convert-triton-gpu-to-llvm
   --convert-triton-gpu-to-llvm="$CONVERT_TRITON_GPU_TO_LLVM"
   #
   # -debug-only='dialect-conversion,greedy-rewriter,pattern-application'
