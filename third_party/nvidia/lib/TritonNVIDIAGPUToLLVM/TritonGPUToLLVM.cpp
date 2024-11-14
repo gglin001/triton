@@ -127,8 +127,9 @@ struct ConvertTritonGPUToLLVM
                                                     patternBenefitDefault);
       mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
                                                             funcPatterns);
-      if (failed(
-              applyPartialConversion(mod, funcTarget, std::move(funcPatterns))))
+      auto frozenfuncPatterns = std::make_shared<FrozenRewritePatternSet>(
+          std::move(funcPatterns), disabledPatterns, enabledPatterns);
+      if (failed(applyPartialConversion(mod, funcTarget, *frozenfuncPatterns)))
         return signalPassFailure();
     }
 
@@ -194,11 +195,19 @@ struct ConvertTritonGPUToLLVM
     mlir::triton::NVIDIA::populateUpcastMXFPToLLVMPatterns(
         typeConverter, patterns, targetInfo, benefit);
 
-    auto frozenPatterns = std::make_shared<FrozenRewritePatternSet>(
-        std::move(patterns), disabledPatterns, enabledPatterns);
-
-    if (failed(applyPartialConversion(mod, convTarget, *frozenPatterns)))
-      return signalPassFailure();
+    if (!disabledPatterns.empty() || !enabledPatterns.empty()) {
+      // convTarget.addLegalDialect<triton::TritonDialect>();
+      // convTarget.addLegalDialect<triton::gpu::TritonGPUDialect>();
+      // convTarget.addLegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
+      // convTarget.addLegalDialect<mlir::gpu::GPUDialect>();
+      auto frozenPatterns = std::make_shared<FrozenRewritePatternSet>(
+          std::move(patterns), disabledPatterns, enabledPatterns);
+      if (failed(applyPartialConversion(mod, convTarget, *frozenPatterns)))
+        return signalPassFailure();
+    } else {
+      if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
+        return signalPassFailure();
+    }
 
     // Fold CTAId when there is only 1 CTA.
     if (numCTAs == 1) {
