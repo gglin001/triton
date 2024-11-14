@@ -176,14 +176,14 @@ triton.runtime.driver.set_active_to_cpu()
 x = torch.rand(size, device='cpu')
 y = torch.rand(size, device='cpu')
 output_torch_cpu = torch.add(x, y)
-output_triton_cpu = add(x, y, None, device='cpu')
+# output_triton_cpu = add(x, y, None, device='cpu')
 print(output_torch_cpu)
-print(output_triton_cpu)
-print(f'The maximum difference between torch-cpu and triton-cpu is '
-      f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
-# output_triton_cpu = add_tiled(x, y, None)
-# print(f'The maximum difference between torch-cpu-tiled and triton-cpu is '
+# print(output_triton_cpu)
+# print(f'The maximum difference between torch-cpu and triton-cpu is '
 #       f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
+output_triton_cpu = add_tiled(x, y, None)
+print(f'The maximum difference between torch-cpu-tiled and triton-cpu is '
+      f'{torch.max(torch.abs(output_torch_cpu - output_triton_cpu))}')
 
 exit(0)
 
