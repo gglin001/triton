@@ -64,6 +64,7 @@ public:
     addIllegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+    addLegalOp<mlir::gpu::ThreadIdOp>();
   }
 };
 

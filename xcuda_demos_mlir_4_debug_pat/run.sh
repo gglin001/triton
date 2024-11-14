@@ -6,8 +6,8 @@
 
 ENABLE_PATTERNS=""
 ENABLE_PATTERNS+="\""
-ENABLE_PATTERNS+="(anonymous namespace)::ReturnOpConversion"
-ENABLE_PATTERNS+=",(anonymous namespace)::FuncOpConversion"
+ENABLE_PATTERNS+="(anonymous namespace)::FuncOpConversion"
+ENABLE_PATTERNS+=",(anonymous namespace)::ReturnOpConversion"
 ENABLE_PATTERNS+="\""
 
 DISABLE_PATTERNS=""
@@ -16,6 +16,8 @@ DISABLE_PATTERNS+="(anonymous namespace)::WarpGroupDotOpConversion"
 DISABLE_PATTERNS+="\""
 
 CONVERT_TRITON_GPU_TO_LLVM="compute-capability=90 enable-patterns=$ENABLE_PATTERNS disable-patterns=$DISABLE_PATTERNS"
+# CONVERT_TRITON_GPU_TO_LLVM="compute-capability=90 enable-patterns=$ENABLE_PATTERNS"
+# CONVERT_TRITON_GPU_TO_LLVM="compute-capability=90 disable-patterns=$DISABLE_PATTERNS"
 
 args=(
   -split-input-file
@@ -33,7 +35,7 @@ args=(
   xcuda_demos_mlir_4_debug_pat/graph.mlir
   -o xcuda_demos_mlir_4_debug_pat/graph.mlir.opt.mlir
 )
-# set -x
+set -x
 triton-opt "${args[@]}" 2>&1 0>&1 | tee xcuda_demos_mlir_4_debug_pat/run.sh.log
 
 ###############################################################################
