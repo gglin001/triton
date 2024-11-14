@@ -300,6 +300,8 @@ else:
     print("❌ TritonCPU and TorchCPU differ, the maximum difference is "
           f'{torch.max(torch.abs(triton_output - torch_output))}')
 
+exit(0)
+
 # %%
 # Benchmark
 # ---------
