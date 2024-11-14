@@ -179,8 +179,18 @@ triton.runtime.driver.set_active_to_cpu()
 x = torch.rand(size, device='cpu')
 y = torch.rand(size, device='cpu')
 output_torch_cpu = torch.add(x, y)
+
 output_triton_cpu = add(x, y, None, device='cpu')
 
+# `translate_to_host_asm` will cost a lot of time
+# from pyinstrument import Profiler
+# profiler = Profiler()
+# profiler.start()
+# output_triton_cpu = add(x, y, None, device='cpu')
+# profiler.stop()
+# profiler.print()
+
+# TODO: support proton on cpu
 # proton.start("add", hook="triton")
 # output_triton_cpu = add(x, y, None, device='cpu')
 # proton.finalize()
