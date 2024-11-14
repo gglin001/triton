@@ -22,6 +22,7 @@ import torch
 
 import triton
 import triton.language as tl
+# import triton.profiler as proton
 
 GPU_BLOCK_SIZE = 1024
 CPU_BLOCK_SIZE = 4096
@@ -129,7 +130,9 @@ def add(x: torch.Tensor, y: torch.Tensor, output: torch.Tensor, device):
     #  - Each torch.tensor object is implicitly converted into a pointer to its first element.
     #  - `triton.jit`'ed functions can be indexed with a launch grid to obtain a callable GPU kernel.
     #  - Don't forget to pass meta-parameters as keywords arguments.
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=CPU_BLOCK_SIZE if device == 'cpu' else GPU_BLOCK_SIZE)
+    # too long compile time for a large CPU_BLOCK_SIZE
+    CPU_BLOCK_SIZE_DEBUG = 256
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=CPU_BLOCK_SIZE_DEBUG if device == 'cpu' else GPU_BLOCK_SIZE)
     # We return a handle to z but, since `torch.cuda.synchronize()` hasn't been called, the kernel is still
     # running asynchronously at this point.
     return output
@@ -176,7 +179,12 @@ triton.runtime.driver.set_active_to_cpu()
 x = torch.rand(size, device='cpu')
 y = torch.rand(size, device='cpu')
 output_torch_cpu = torch.add(x, y)
+output_triton_cpu = add(x, y, None, device='cpu')
+
+# proton.start("add", hook="triton")
 # output_triton_cpu = add(x, y, None, device='cpu')
+# proton.finalize()
+
 print(output_torch_cpu)
 # print(output_triton_cpu)
 # print(f'The maximum difference between torch-cpu and triton-cpu is '
