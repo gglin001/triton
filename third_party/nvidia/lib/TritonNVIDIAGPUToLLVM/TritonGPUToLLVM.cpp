@@ -82,6 +82,22 @@ struct ConvertTritonGPUToLLVM
   ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion)
       : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion}) {}
 
+  ConvertTritonGPUToLLVM(int32_t computeCapability,
+                         ArrayRef<std::string> disabledPatterns,
+                         ArrayRef<std::string> enabledPatterns)
+      : ConvertTritonGPUToLLVMBase({computeCapability}) {
+    this->disabledPatterns = disabledPatterns;
+    this->enabledPatterns = enabledPatterns;
+  }
+
+  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
+                         ArrayRef<std::string> disabledPatterns,
+                         ArrayRef<std::string> enabledPatterns)
+      : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion}) {
+    this->disabledPatterns = disabledPatterns;
+    this->enabledPatterns = enabledPatterns;
+  }
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
@@ -177,7 +193,11 @@ struct ConvertTritonGPUToLLVM
                                                    patterns, benefit);
     mlir::triton::NVIDIA::populateUpcastMXFPToLLVMPatterns(
         typeConverter, patterns, targetInfo, benefit);
-    if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
+
+    auto frozenPatterns = std::make_shared<FrozenRewritePatternSet>(
+        std::move(patterns), disabledPatterns, enabledPatterns);
+
+    if (failed(applyPartialConversion(mod, convTarget, *frozenPatterns)))
       return signalPassFailure();
 
     // Fold CTAId when there is only 1 CTA.
@@ -235,6 +255,22 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability,
                                  int32_t ptxVersion) {
   return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability,
                                                   ptxVersion);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int32_t computeCapability,
+                                 ArrayRef<std::string> disabledPatterns,
+                                 ArrayRef<std::string> enabledPatterns) {
+  return std::make_unique<ConvertTritonGPUToLLVM>(
+      computeCapability, disabledPatterns, enabledPatterns);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
+                                 ArrayRef<std::string> disabledPatterns,
+                                 ArrayRef<std::string> enabledPatterns) {
+  return std::make_unique<ConvertTritonGPUToLLVM>(
+      computeCapability, ptxVersion, disabledPatterns, enabledPatterns);
 }
 
 bool NVIDIA::canSkipBarSync(Operation *before, Operation *after) {

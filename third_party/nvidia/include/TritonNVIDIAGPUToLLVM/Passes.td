@@ -2,6 +2,7 @@
 #define TRITONGPU_CONVERSION_PASSES
 
 include "mlir/Pass/PassBase.td"
+include "mlir/Rewrite/PassUtil.td"
 
 def DecomposeUnsupportedNVIDIAConversions : Pass<"decompose-unsupported-nvidia-conversions", "mlir::ModuleOp"> {
     let summary = "Decompose conversions that are not supported by TritonGPU -> LLVM";
@@ -33,7 +34,7 @@ def ConvertTritonGPUToLLVM : Pass<"convert-triton-gpu-to-llvm", "mlir::ModuleOp"
         Option<"ptxVersion", "ptx-version",
                "int32_t", /*default*/"80",
                "PTX version">,
-    ];
+    ] # RewritePassUtils.options;
 }
 
 #endif
