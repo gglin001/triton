@@ -8,6 +8,10 @@ ENABLE_PATTERNS=""
 ENABLE_PATTERNS+="\""
 ENABLE_PATTERNS+="(anonymous namespace)::FuncOpConversion"
 ENABLE_PATTERNS+=",(anonymous namespace)::ReturnOpConversion"
+#
+# ENABLE_PATTERNS+=",(anonymous namespace)::WarpGroupDotOpConversion"
+# ENABLE_PATTERNS+=",(anonymous namespace)::IndexCastOpLowering"
+#
 ENABLE_PATTERNS+="\""
 
 DISABLE_PATTERNS=""
