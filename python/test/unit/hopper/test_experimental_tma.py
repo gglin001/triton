@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.experimental_descriptor import (create_1d_tma_descriptor, create_2d_tma_descriptor)
-from triton._internal_testing import dtypes_with_bfloat16, numpy_random, to_triton, requires_tma
+from triton._internal_testing import dtypes_with_bfloat16, numpy_random, to_triton, requires_tma, supports_tma, tma_skip_msg
 
 from typing import Optional
 
@@ -29,9 +29,11 @@ def unwrap_tensor(t: torch.Tensor | triton.runtime.jit.TensorWrapper):
 tma_dtypes = sorted(set(dtypes_with_bfloat16) - {"int64", "uint64", "float64"})
 
 
-@requires_tma
 @pytest.mark.parametrize("byval_tma", [True, False])
 def test_experimetal_descriptor_load(byval_tma):
+    if not supports_tma(byval_tma):
+        pytest.skip(tma_skip_msg(byval_tma))
+
     device = "cuda"
     SIZE = 128
 
@@ -82,11 +84,13 @@ def matmul_kernel_tma(a_desc_ptr, b_desc_ptr, c_desc_ptr,  #
     tl._experimental_descriptor_store(c_desc_ptr, accumulator, [offs_am, offs_bn])
 
 
-@requires_tma
 @pytest.mark.parametrize("num_stages", [1, 4])
 @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(32, 32, 32), (128, 64, 64), (128, 128, 64), (128, 256, 64)])
 @pytest.mark.parametrize("byval_tma", [True, False])
 def test_experimental_tma_matmul(num_stages, BLOCK_M, BLOCK_N, BLOCK_K, byval_tma):
+    if not supports_tma(byval_tma):
+        pytest.skip(tma_skip_msg(byval_tma))
+
     device = "cuda"
     M, N, K = 8192, 8192, 1024
     torch.manual_seed(42)
@@ -460,3 +464,77 @@ def test_experimental_make_tensor_descriptor_matmul(num_stages, BLOCK_M, BLOCK_N
     assert "tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned" in kernel.asm["ptx"]
     if BLOCK_M >= 64 and BLOCK_N >= 64:
         assert "stmatrix.sync.aligned.m8n8.x4.shared.b16" in kernel.asm["ptx"]
+
+
+@triton.jit
+def kernel_make_tensor_desciptor_loop_carried(a_ptr, M, N, MBLOCK: tl.constexpr, NBLOCK: tl.constexpr):
+    # Test that descriptors work with
+    pid = tl.program_id(0)
+    moffset = MBLOCK * pid
+
+    a_desc = tl._experimental_make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[MBLOCK, NBLOCK],
+    )
+
+    for i in range(0, N, NBLOCK):
+        assert isinstance(a_desc, tl._experimental_tensor_descriptor)
+        if i % (3 * NBLOCK) == 0:
+            a_desc = tl._experimental_make_tensor_descriptor(
+                a_ptr,
+                shape=[M, N],
+                strides=[N, 1],
+                block_shape=[MBLOCK, NBLOCK],
+            )
+            assert isinstance(a_desc, tl._experimental_tensor_descriptor)
+        assert isinstance(a_desc, tl._experimental_tensor_descriptor)
+        a = a_desc.load([moffset, i])
+        a_desc.store([moffset, i], a + 10)
+
+    n = 0
+    while n < N:
+        assert isinstance(a_desc, tl._experimental_tensor_descriptor)
+        if n % (3 * NBLOCK) == 0:
+            assert isinstance(a_desc, tl._experimental_tensor_descriptor)
+            a_desc = tl._experimental_make_tensor_descriptor(
+                a_ptr,
+                shape=[M, N],
+                strides=[N, 1],
+                block_shape=[MBLOCK, NBLOCK],
+            )
+        assert isinstance(a_desc, tl._experimental_tensor_descriptor)
+        a = a_desc.load([moffset, n])
+        a_desc.store([moffset, n], a + 5)
+
+        n += NBLOCK
+
+
+@requires_tma
+def test_experimental_make_tensor_descriptor_loop_carried():
+    device = "cuda"
+    M, N = 8192, 8192
+    torch.manual_seed(42)
+    A = torch.randn((M, N), dtype=torch.float32, device=device)
+    MBLOCK, NBLOCK = 8, 128
+    grid = (triton.cdiv(M, MBLOCK), )
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert size == 128 * grid[0]
+        assert align == 128
+        assert stream == 0
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    triton.set_allocator(alloc_fn)
+
+    ref_out = A + 15
+    kernel = kernel_make_tensor_desciptor_loop_carried[grid](
+        A,
+        M,
+        N,
+        MBLOCK,
+        NBLOCK,
+    )
+    torch.testing.assert_close(ref_out, A)
+    assert "tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned" in kernel.asm["ptx"]
