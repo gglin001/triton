@@ -19,13 +19,16 @@ popd
 
 ###############################################################################
 
+rm -rf build/CMakeFiles
+rm -rf build/CMakeCache.txt
+
 # cmake --preset osx
 cmake --preset osx_allen
 
 cmake --build $PWD/build --target all
 
-cmake --build $PWD/build --target help
-cmake --build $PWD/build --target triton
+# cmake --build $PWD/build --target help
+# cmake --build $PWD/build --target triton
 
 ###############################################################################
 
