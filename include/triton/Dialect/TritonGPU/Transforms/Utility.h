@@ -116,10 +116,10 @@ protected:
 };
 
 // Infers the encoding of the result of op given the source encoding.
-std::optional<Attribute> inferDstEncoding(Operation *op, Attribute encoding);
+Attribute inferDstEncoding(Operation *op, Attribute encoding);
 
 // Infers the encoding of the source of op given the result encoding.
-std::optional<Attribute> inferSrcEncoding(Operation *op, Attribute encoding);
+Attribute inferSrcEncoding(Operation *op, Attribute encoding);
 
 bool isExpensiveLoadOrStore(Operation *op);
 
@@ -163,7 +163,8 @@ Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
 LogicalResult getConvertBackwardSlice(
     Value root, SetVector<Value> &slice, Attribute rootEncoding,
     DenseMap<Value, Attribute> &layout,
-    std::function<bool(Operation *)> stopPropagation = nullptr);
+    std::function<bool(Operation *)> stopPropagation = nullptr,
+    std::function<Value(Value, Attribute)> getExistingConversion = nullptr);
 
 // Populate pattern to remove dead cycles in ForOp.
 void populateForOpDeadArgumentElimination(RewritePatternSet &patterns);
