@@ -8,8 +8,10 @@
 #include "third_party/f2reduce/f2reduce.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/StrUtil.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetOperations.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -117,11 +119,6 @@ std::unique_ptr<uint64_t[]> getMatrix(const LinearLayout &layout) {
 // outDim as columns.  In other words, finds the number of linearly-independent
 // bases for this output dimension.
 int getMatrixRank(std::unique_ptr<uint64_t[]> m, int numRows, int numCols) {
-  // f2reduce underflows if the number of cols is 0, return the rank early in
-  // this case.
-  if (numCols == 0) {
-    return 0;
-  }
   // stride is specified in number of 64-bit words per row, and we pack our
   // matrix so that there's only one uint64_t per row.
   assert(numCols <= 64);
@@ -157,36 +154,6 @@ void assertDimsSubsetIgnoringOrder(T &&small, U &&big) {
                              "they aren't.  Got dims: [" +
                              Twine(triton::join(small, ", ")) + "] and [" +
                              triton::join(big, ", ") + "]");
-  }
-}
-
-// Check that elements common to both aDims and bDims
-// appear in the same relative order.
-template <typename T, typename U>
-void assertCommonDimsSameOrder(T &&aDims, U &&bDims) {
-  SmallDenseSet<StringAttr> aDimsSet(aDims.begin(), aDims.end());
-  SmallDenseSet<StringAttr> bDimsSet(bDims.begin(), bDims.end());
-
-  std::vector<StringAttr> aCommonDims;
-  for (StringAttr dim : aDims) {
-    if (bDimsSet.contains(dim)) {
-      aCommonDims.push_back(dim);
-    }
-  }
-
-  std::vector<StringAttr> bCommonDims;
-  for (StringAttr dim : bDims) {
-    if (aDimsSet.contains(dim)) {
-      bCommonDims.push_back(dim);
-    }
-  }
-
-  if (aCommonDims != bCommonDims) {
-    llvm::report_fatal_error("All a/b dimensions common to both layouts "
-                             "must appear in the same relative order, but they "
-                             "don't.\na:" +
-                             Twine(triton::join(aDims, ", ")) +
-                             "\nb: " + triton::join(bDims, ", "));
   }
 }
 } // anonymous namespace
@@ -344,7 +311,8 @@ LinearLayout::LinearLayout(
 
 /*static*/ LinearLayout LinearLayout::zeros1D(int32_t size,
                                               StringAttr inDimName,
-                                              StringAttr outDimName) {
+                                              StringAttr outDimName,
+                                              int32_t outDimSize) {
   if (size == 0)
     return LinearLayout::empty();
 
@@ -353,7 +321,8 @@ LinearLayout::LinearLayout(
   for (int i = 0; i < llvm::Log2_32(size); i++) {
     zeros.emplace_back().push_back(0);
   }
-  return LinearLayout({{inDimName, zeros}}, {outDimName});
+  return LinearLayout({{inDimName, zeros}}, {{outDimName, outDimSize}},
+                      /*requiresSurjective=*/outDimSize == 1);
 }
 
 int32_t LinearLayout::getOutDimIndex(StringAttr outDim) const {
@@ -542,16 +511,71 @@ LinearLayout LinearLayout::reshapeOuts(
   return LinearLayout(std::move(newBases), newOutDims, surjective);
 }
 
+LinearLayout LinearLayout::concatIns(const LinearLayout &other) const {
+  assert(llvm::to_vector(getOutDimNames()) ==
+             llvm::to_vector(other.getOutDimNames()) &&
+         "layouts must have the same output dimensions");
+  for (StringAttr outDim : getOutDimNames()) {
+    assert(getOutDimSize(outDim) == other.getOutDimSize(outDim) &&
+           "layouts must have the same output dimension sizes");
+  }
+
+  LinearLayout::BasesT resultBases = getBases();
+  for (auto &bases : other.getBases())
+    resultBases.insert(bases);
+  SmallVector<std::pair<StringAttr, int32_t>> newOutDims;
+  for (auto &[outDim, outDimSize] : outDims)
+    newOutDims.emplace_back(outDim, outDimSize);
+  return LinearLayout(std::move(resultBases), newOutDims,
+                      /*requiresSurjective=*/false);
+}
+
+LinearLayout LinearLayout::concatOuts(const LinearLayout &other) const {
+  assert(llvm::to_vector(getInDimNames()) ==
+             llvm::to_vector(other.getInDimNames()) &&
+         "layouts must have the same input dimensions");
+  for (StringAttr inDim : getInDimNames()) {
+    assert(getInDimSize(inDim) == other.getInDimSize(inDim) &&
+           "layouts must have the same input dimension sizes");
+  }
+
+  LinearLayout::BasesT result;
+  for (auto [lhsBases, rhsBases] : llvm::zip(getBases(), other.getBases())) {
+    auto &resultBases = result[lhsBases.first];
+    assert(lhsBases.first == rhsBases.first);
+    for (auto [lhsBasis, rhsBasis] :
+         llvm::zip(lhsBases.second, rhsBases.second)) {
+      std::vector<int32_t> resultBasis;
+      llvm::append_range(resultBasis, lhsBasis);
+      llvm::append_range(resultBasis, rhsBasis);
+      resultBases.push_back(std::move(resultBasis));
+    }
+  }
+  SmallVector<std::pair<StringAttr, int32_t>> newOutDims;
+  for (auto &[outDim, outDimSize] : outDims)
+    newOutDims.emplace_back(outDim, outDimSize);
+  for (auto &[outDim, outDimSize] : other.outDims)
+    newOutDims.emplace_back(outDim, outDimSize);
+  return LinearLayout(std::move(result), newOutDims,
+                      /*requiresSurjective=*/false);
+}
+
 LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
   // Check that dims common to outer and inner have the same relative order.
-  assertCommonDimsSameOrder(inner.getOutDimNames(), outer.getOutDimNames());
-  assertCommonDimsSameOrder(inner.getInDimNames(), outer.getInDimNames());
+  auto inDims = supremum(llvm::to_vector(inner.getInDimNames()),
+                         llvm::to_vector(outer.getInDimNames()));
+  auto outDims = supremum(llvm::to_vector(inner.getOutDimNames()),
+                          llvm::to_vector(outer.getOutDimNames()));
 
   // Get the sizeLog2 of all input and output dimensions we're going to
   // consider, in order.  `inner` is more minor, so its dimensions come
   // first.
   llvm::MapVector<StringAttr, int32_t> inDimSizesLog2;
   llvm::MapVector<StringAttr, int32_t> outDimSizesLog2;
+  for (const auto &dim : inDims)
+    inDimSizesLog2.insert({dim, 0});
+  for (const auto &dim : outDims)
+    outDimSizesLog2.insert({dim, 0});
   for (const auto &layout : {inner, outer}) {
     for (StringAttr inDim : layout.getInDimNames()) {
       inDimSizesLog2[inDim] += layout.getInDimSizeLog2(inDim);
@@ -931,6 +955,8 @@ LinearLayout LinearLayout::invert() const {
 
 LinearLayout LinearLayout::pseudoinvert() const {
   // A^-1(x) = A^-1(I(x)), thus A.invert() = I.invertAndCompose(A)
+  assert(isSurjective() &&
+         "A linear layout must be surjective to compute its pseudoinverse");
   LinearLayout identity = LinearLayout::empty();
   for (auto outDim : getOutDimNames()) {
     identity *= LinearLayout::identity1D(getOutDimSize(outDim), outDim, outDim);
@@ -971,6 +997,23 @@ LinearLayout::getFreeVariableMasks() const {
     ret[dim] = mask;
   }
   return ret;
+}
+
+LinearLayout LinearLayout::removeZeroBasesAlongDim(StringAttr stripDim) const {
+  LinearLayout::BasesT result;
+  for (auto &[inDim, inDimBases] : getBases()) {
+    auto &newInDimBases = result[inDim];
+    if (inDim != stripDim) {
+      newInDimBases = inDimBases;
+      continue;
+    }
+    for (auto &basis : inDimBases) {
+      if (llvm::any_of(basis, [](int32_t val) { return val != 0; })) {
+        newInDimBases.push_back(basis);
+      }
+    }
+  }
+  return LinearLayout(std::move(result), llvm::to_vector(getOutDimNames()));
 }
 
 size_t hash_value(const LinearLayout &layout) {

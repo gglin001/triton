@@ -36,7 +36,7 @@ class Autotuner(KernelInterface):
             'prune_num_stages_by'(optional): a function used to prune num_stages. It takes configs:List[Config] as its input, and returns pruned configs.
         """
         if not configs:
-            self.configs = [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
+            self.configs = [Config({}, num_warps=4, num_stages=3, num_ctas=1)]
         else:
             self.configs = configs
         self.keys = key
@@ -221,7 +221,7 @@ class Autotuner(KernelInterface):
                 top_k = int(len(self.configs) * top_k)
             elif not isinstance(top_k, int):
                 # Slice index must be an integer
-                raise TypeError(f"Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int")
+                raise TypeError("Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int")
 
             if len(pruned_configs) > top_k:
                 est_timing = {
@@ -269,7 +269,7 @@ class Config:
                     function are args.
     """
 
-    def __init__(self, kwargs, num_warps=4, num_stages=2, num_ctas=1, maxnreg=None, pre_hook=None):
+    def __init__(self, kwargs, num_warps=4, num_stages=3, num_ctas=1, maxnreg=None, pre_hook=None):
         self.kwargs = kwargs
         self.num_warps = num_warps
         self.num_ctas = num_ctas
@@ -361,7 +361,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     def decorator(fn):
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                         use_cuda_graph=use_cuda_graph)
+                         use_cuda_graph=use_cuda_graph, do_bench=do_bench)
 
     return decorator
 
