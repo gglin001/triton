@@ -97,21 +97,16 @@ struct ConvertTritonGPUToLLVM
     membarPass.run();
 
     // Lower functions
-    {
-      mlir::LowerToLLVMOptions option(context);
-      TritonGPUToLLVMTypeConverter typeConverter(context, option, targetInfo);
-      TritonLLVMFunctionConversionTarget funcTarget(*context);
-      RewritePatternSet funcPatterns(context);
-      mlir::triton::populateFuncOpConversionPattern(typeConverter, funcPatterns,
-                                                    numWarps, targetInfo,
-                                                    patternBenefitDefault);
-      mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
-                                                            funcPatterns);
-      auto frozenfuncPatterns = std::make_shared<FrozenRewritePatternSet>(
-          std::move(funcPatterns), disabledPatterns, enabledPatterns);
-      if (failed(applyPartialConversion(mod, funcTarget, *frozenfuncPatterns)))
-        return signalPassFailure();
-    }
+    TritonLLVMFunctionConversionTarget funcTarget(*context);
+    RewritePatternSet funcPatterns(context);
+    TritonGPUToLLVMTypeConverter funcTypeConverter(context, targetInfo);
+    mlir::triton::populateFuncOpConversionPattern(
+        funcTypeConverter, funcPatterns, targetInfo, patternBenefitDefault);
+    mlir::cf::populateControlFlowToLLVMConversionPatterns(funcTypeConverter,
+                                                          funcPatterns);
+    if (failed(
+            applyPartialConversion(mod, funcTarget, std::move(funcPatterns))))
+      return signalPassFailure();
 
     // initSharedMemory is run before the conversion of call and ret ops,
     // because the call op has to know the shared memory base address of each

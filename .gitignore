@@ -1,3 +1,11 @@
+# custom
+CMakeUserPresets.json
+python/triton/_C/libtriton.pyi
+python/triton/_C/libtriton/
+
+.clangd
+triton-shared
+
 # Triton builds
 build/
 build-*/
@@ -84,8 +92,3 @@ docs/sg_execution_times.rst
 
 # macOS
 .DS_Store
-
-CMakeUserPresets.json
-CMakeUserPresets.json
-.clangd
-python/triton/_C/libtriton/
