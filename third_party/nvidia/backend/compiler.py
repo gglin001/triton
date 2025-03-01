@@ -427,12 +427,13 @@ class CUDABackend(BaseBackend):
         return cubin
 
     def add_stages(self, stages, options):
+        capability = self._parse_arch(options.arch)
         stages["ttir"] = lambda src, metadata: self.make_ttir_raw(src, metadata, options)
         stages["opt.ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-        stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, self.capability)
-        stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, self.capability)
-        stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.capability)
-        stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.capability)
+        stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, capability)
+        stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
+        stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)
+        stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.target.arch)
 
     @functools.lru_cache()
     def hash(self):
