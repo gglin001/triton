@@ -14,3 +14,4 @@ index-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 [dependencies]
 python = "==3.13"
 mlir = ">=20.1.8,<21"
+pytorch = ">=2.7.1,<3"
