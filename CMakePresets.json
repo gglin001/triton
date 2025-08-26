@@ -1,5 +1,5 @@
 {
-  "version": 8,
+  "version": 10,
   "configurePresets": [
     {
       "name": "osx",
@@ -11,26 +11,20 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++",
-        "CMAKE_LINKER_TYPE": "LLD",
+        "CMAKE_SYSROOT": "/",
+        "CMAKE_LINKER_TYPE": "MOLD",
         "CMAKE_INSTALL_RPATH_USE_LINK_PATH": true,
         "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/bin",
-        "LLVM_DIR": "llvm-triton/llvm-project/build/lib/cmake/llvm",
-        "MLIR_DIR": "llvm-triton/llvm-project/build/lib/cmake/mlir",
-        "TRITON_BUILD_PYTHON_MODULE": true,
+        "LLVM_DIR": "${sourceDir}/llvm-triton/llvm-project/build/lib/cmake/llvm",
+        "MLIR_DIR": "${sourceDir}/llvm-triton/llvm-project/build/lib/cmake/mlir",
+        "LLD_DIR": "${sourceDir}/llvm-triton/llvm-project/build/lib/cmake/lld",
         "TRITON_BUILD_PROTON": false,
         "TRITON_BUILD_UT": false,
         "TRITON_CODEGEN_BACKENDS": "nvidia;amd",
+        "TRITON_BUILD_PYTHON_MODULE": true,
+        "LLVM_SYSPATH": "llvm-triton/llvm-project/build",
+        "TRITON_WHEEL_DIR": "llvm-triton/llvm-project/build/bin",
         "LLVM_ENABLE_ASSERTIONS": true
-      }
-    },
-    {
-      "name": "demo",
-      "inherits": "osx",
-      "cacheVariables": {
-        "CMAKE_C_COMPILER": "llvm-dpcpp/build/bin/clang",
-        "CMAKE_CXX_COMPILER": "llvm-dpcpp/build/bin/clang++",
-        "LLVM_DIR": "llvm-mlir/build/lib/cmake/llvm",
-        "MLIR_DIR": "llvm-mlir/build/lib/cmake/mlir"
       }
     }
   ]
