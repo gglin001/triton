@@ -13,7 +13,7 @@ LogicalResult verifyTransposeOpInterface(Operation *op) {
   TransposeOpInterface transposeOp = cast<TransposeOpInterface>(op);
   auto rank = cast<ShapedType>(transposeOp.getSrc().getType()).getRank();
   auto order = transposeOp.getOrder();
-  if (rank != order.size()) {
+  if (static_cast<size_t>(rank) != order.size()) {
     return op->emitError(
         "order must have the same size as the rank of the operand and result");
   }
@@ -64,8 +64,7 @@ LogicalResult verifyDotOpInterface(Operation *op) {
                               "operand to be equal to the first dimension of "
                               "the result");
   // Check the output shape
-  if (cShape[cShape.size() - 2] != aShape[aShape.size() - 2] ||
-      cShape[cShape.size() - 1] != bShape[aShape.size() - 1])
+  if (!dotOp.verifyOutputDims())
     return dotOp->emitOpError(
         "expected the output shape to be the concatenation of the last "
         "dimension of the first operand and the last dimension of the "

@@ -1,15 +1,15 @@
-// RUN: triton-opt %s -split-input-file -convert-triton-to-tritongpu=target=cuda:80 2>&1 | FileCheck %s --check-prefix=GPU
-// RUN: triton-opt %s -split-input-file -convert-triton-to-tritongpu=target=cuda:80 -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s --check-prefix=LLVM
+// RUN: triton-opt %s -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s
 
 // triton-opt test/TritonGPU/atomic-cas.mlir -split-input-file -convert-triton-to-tritongpu=target=cuda:80 -convert-triton-gpu-to-llvm
 
 // GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
 // LLVM: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
 
-module {
-  tt.func public @atomic_cas_kernel_0d1d2e(%arg0: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg2: i32 {tt.max_divisibility = 8 : i32}) attributes {noinline = false} {
-    %cst = arith.constant dense<2> : tensor<2xi64>
-    %cst_0 = arith.constant dense<1> : tensor<2xi64>
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @atomic_cas_kernel_0d1d2e(%arg0: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg2: i32 {tt.max_divisibility = 8 : i32}) {
+    %cst = arith.constant dense<2> : tensor<2xi64, #blocked>
+    %cst_0 = arith.constant dense<1> : tensor<2xi64, #blocked>
     %c2_i32 = arith.constant 2 : i32
     %0 = tt.get_program_id x : i32
     %1 = arith.muli %0, %c2_i32 : i32

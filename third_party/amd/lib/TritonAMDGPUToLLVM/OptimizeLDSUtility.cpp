@@ -1,29 +1,12 @@
 #include "OptimizeLDSUtility.h"
+#include "Analysis/AMDGPUAllocation.h"
 #include "triton/Analysis/Allocation.h"
-#include "triton/Conversion/TritonGPUToLLVM/Patterns.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton::AMD {
-
-constexpr int kPtrBitWidth = 64;
-
-int getCvtOpLDSUsage(RankedTensorType srcTy, RankedTensorType dstTy) {
-  auto scratchConfig = getScratchConfigForCvt(srcTy, dstTy);
-  unsigned elems = getNumScratchElements(scratchConfig.paddedRepShape);
-  auto bytes =
-      isa<triton::PointerType>(srcTy.getElementType())
-          ? elems * kPtrBitWidth / 8
-          : elems * std::max<int>(8, srcTy.getElementTypeBitWidth()) / 8;
-
-  return bytes;
-}
-
-int getCvtOpLDSUsage(triton::gpu::ConvertLayoutOp op) {
-  return getCvtOpLDSUsage(op.getSrc().getType(), op.getType());
-}
 
 static void stepFactorizationPow2(std::vector<SmallVector<unsigned>> &factors,
                                   SmallVector<unsigned> &curFactor,
@@ -55,9 +38,8 @@ createTmpLayout(triton::gpu::DistributedEncodingTrait layout,
   auto ctx = layout.getContext();
   if (auto src = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(layout))
     return triton::gpu::AMDMfmaEncodingAttr::get(
-        ctx, src.getVersionMajor(), src.getVersionMinor(), warpsPerCTA,
-        src.getMDim(), src.getNDim(), src.getIsTransposed(),
-        src.getCTALayout());
+        ctx, src.getVersion(), warpsPerCTA, src.getMDim(), src.getNDim(),
+        src.getIsTransposed(), src.getCTALayout(), src.getElementType());
   if (auto src = dyn_cast<triton::gpu::AMDWmmaEncodingAttr>(layout))
     return triton::gpu::AMDWmmaEncodingAttr::get(
         ctx, src.getVersion(), src.getIsTransposed(), warpsPerCTA,
@@ -68,18 +50,24 @@ createTmpLayout(triton::gpu::DistributedEncodingTrait layout,
         src.getOrder(), src.getCTALayout());
   if (auto src = dyn_cast<triton::gpu::DotOperandEncodingAttr>(layout)) {
     auto parent = cast<triton::gpu::DistributedEncodingTrait>(src.getParent());
-    return triton::gpu::DotOperandEncodingAttr::get(
-        ctx, src.getOpIdx(), createTmpLayout(parent, warpsPerCTA),
-        src.getKWidth());
+    parent = createTmpLayout(parent, warpsPerCTA);
+    if (!parent)
+      return {};
+    return triton::gpu::DotOperandEncodingAttr::get(ctx, src.getOpIdx(), parent,
+                                                    src.getKWidth());
   }
   if (auto src = dyn_cast<triton::gpu::SliceEncodingAttr>(layout)) {
-    // TODO: think of a way to construct slice layouts based on warpsPerCTA
-    // argument
-    auto parentWarpsPerCTA = triton::gpu::getWarpsPerCTA(src.getParent());
-    return triton::gpu::SliceEncodingAttr::get(
-        ctx, src.getDim(), createTmpLayout(src.getParent(), parentWarpsPerCTA));
+    auto warps = to_vector(warpsPerCTA);
+    warps.insert(warps.begin() + src.getDim(), 1);
+    auto parent = createTmpLayout(src.getParent(), warps);
+    if (!parent)
+      return {};
+    return triton::gpu::SliceEncodingAttr::get(ctx, src.getDim(), parent);
   }
-  assert("Encountered unsupported layout");
+  // TODO: support linear layout if needed.
+  if (isa<triton::gpu::LinearEncodingAttr>(layout))
+    return {};
+  assert(false && "Encountered unsupported layout");
   return {};
 }
 
@@ -98,6 +86,8 @@ createNewConvertOps(OpBuilder &builder, triton::gpu::ConvertLayoutOp &cvtOp,
       cvtOp.getLoc(), newSrcType, cvtOp.getSrc());
   auto newEpilogueCvt = builder.create<triton::gpu::ConvertLayoutOp>(
       cvtOp.getLoc(), newDstType, tmpCvt);
+  tmpCvt->setAttrs(cvtOp->getAttrs());
+  newEpilogueCvt->setAttrs(cvtOp->getAttrs());
 
   return std::make_pair(tmpCvt, newEpilogueCvt);
 }
@@ -111,10 +101,20 @@ estimateResourcesForReplacement(OpBuilder builder,
   RankedTensorType dstTy = cvtOp.getType();
   RankedTensorType intermediateTy = RankedTensorType::get(
       srcTy.getShape(), srcTy.getElementType(), tmpLayout);
+  auto *ctx = cvtOp->getContext();
 
-  int tmpCvtLDS = mlir::triton::AMD::getCvtOpLDSUsage(srcTy, intermediateTy);
-  int newCvtLDS = mlir::triton::AMD::getCvtOpLDSUsage(intermediateTy, dstTy);
-  res.LDS = std::max(tmpCvtLDS, newCvtLDS);
+  int tmpCvtLDS = getConvertLayoutScratchInBytes(srcTy, intermediateTy,
+                                                 /*usePadding*/ true);
+  int tmpCvtLDSNoPad = getConvertLayoutScratchInBytes(srcTy, intermediateTy,
+                                                      /*usePadding*/ false);
+  int newCvtLDS = getConvertLayoutScratchInBytes(intermediateTy, dstTy,
+                                                 /*usePadding*/ true);
+  int newCvtLDSNoPad = getConvertLayoutScratchInBytes(intermediateTy, dstTy,
+                                                      /*usePadding*/ false);
+
+  res.LDSPad = std::max(tmpCvtLDS, newCvtLDS);
+  res.LDSSwizzle = std::max(tmpCvtLDSNoPad, newCvtLDSNoPad);
+
   return res;
 }
 

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/IR/Function.h"
 
 #include <memory>
 
@@ -23,9 +24,6 @@ namespace mlir::triton {
 } // namespace mlir::triton
 
 namespace mlir::triton::AMD {
-std::unique_ptr<OperationPass<ModuleOp>>
-createDecomposeUnsupportedConversionsPass(StringRef targetArch);
-
 /// @brief Creates pass that keep LDS consumption within specified limits.
 /// @param arch target architecture name, for example "gfx940"
 /// @param customLDSLimit defines LDS size available for one thread block
@@ -33,6 +31,9 @@ createDecomposeUnsupportedConversionsPass(StringRef targetArch);
 /// @return created pass
 std::unique_ptr<OperationPass<ModuleOp>>
 createOptimizeLDSUsagePass(StringRef arch, int32_t customLDSLimit = 0);
+
+void runScalarizePackedFOpsPass(llvm::Function &F);
+
 } // namespace mlir::triton::AMD
 
 namespace mlir::triton {
