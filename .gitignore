@@ -6,6 +6,11 @@ python/triton/_C/libtriton/
 .clangd
 triton-shared
 
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+pixi.lock
+
 # Triton builds
 build/
 build-*/
@@ -97,8 +102,3 @@ docs/sg_execution_times.rst
 
 # macOS
 .DS_Store
-
-# pixi environments
-.pixi/*
-!.pixi/config.toml
-pixi.lock

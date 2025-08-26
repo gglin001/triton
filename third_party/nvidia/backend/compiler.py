@@ -226,11 +226,7 @@ class CUDABackend(BaseBackend):
             CUDABackend.instrumentation.load_dialects(ctx)
 
     @staticmethod
-    def make_ttir_raw(mod, metadata, opt):
-        return mod
-
-    @staticmethod
-    def make_ttir(mod, metadata, opt):
+    def make_ttir(mod, metadata, opt, capability):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
@@ -514,12 +510,14 @@ please share the reproducer above with Triton project.
 
     def add_stages(self, stages, options, language):
         capability = self._parse_arch(options.arch)
-        stages["ttir"] = lambda src, metadata: self.make_ttir_raw(src, metadata, options)
-        stages["opt.ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-        stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, capability)
+        if language == Language.TRITON:
+            stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options, capability)
+            stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, capability)
+        elif language == Language.GLUON:
+            stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options, capability)
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
-        stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, capability)
-        stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, capability)
+        stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)
+        stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.target.arch)
 
     @functools.lru_cache()
     def hash(self):
