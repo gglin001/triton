@@ -92,3 +92,8 @@ docs/sg_execution_times.rst
 
 # macOS
 .DS_Store
+
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+pixi.lock

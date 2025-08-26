@@ -1,0 +1,16 @@
+[workspace]
+authors = ["Allen Guo <guosonglin001@gmail.com>"]
+channels = ["conda-forge"]
+name = "triton"
+platforms = ["linux-aarch64"]
+version = "0.1.0"
+
+[pypi-options]
+index-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+
+[tasks]
+
+[dependencies]
+python = "==3.13"
+mlir = ">=20.1.8,<21"
