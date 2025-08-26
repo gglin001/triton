@@ -22,8 +22,8 @@
         "TRITON_BUILD_UT": false,
         "TRITON_CODEGEN_BACKENDS": "nvidia;amd",
         "TRITON_BUILD_PYTHON_MODULE": true,
-        "LLVM_SYSPATH": "llvm-triton/llvm-project/build",
-        "TRITON_WHEEL_DIR": "llvm-triton/llvm-project/build/bin",
+        "LLVM_SYSPATH": "${sourceDir}/llvm-triton/llvm-project/build",
+        "TRITON_WHEEL_DIR": "${sourceDir}/build/bin",
         "LLVM_ENABLE_ASSERTIONS": true
       }
     }
