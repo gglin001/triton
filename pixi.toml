@@ -19,4 +19,4 @@ uv = ">=0.8.13,<0.9"
 
 [activation]
 # needs llvm-triton
-env = { PATH = "${PWD}/llvm-triton/llvm-project/build/bin:${PATH}" }
+env = { PATH = "${PWD}/build/bin:${PWD}/llvm-triton/llvm-project/build/bin:${PATH}" }
