@@ -26,6 +26,16 @@
         "TRITON_WHEEL_DIR": "${sourceDir}/build/bin",
         "LLVM_ENABLE_ASSERTIONS": true
       }
+    },
+    {
+      "name": "osx_proton",
+      "inherits": "osx",
+      "cacheVariables": {
+        "TRITON_BUILD_PROTON": true,
+        "CUPTI_INCLUDE_DIR": "${sourceDir}/third_party/nvidia/backend/include",
+        "ROCTRACER_INCLUDE_DIR": "${sourceDir}/third_party/amd/backend/include",
+        "JSON_INCLUDE_DIR": "${sourceDir}/.pixi/envs/default/include"
+      }
     }
   ]
 }
