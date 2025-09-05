@@ -794,6 +794,9 @@ PYTHON_CLASSIFIERS = [
 ]
 CLASSIFIERS = BASE_CLASSIFIERS + PYTHON_CLASSIFIERS
 
+# disable `ext_modules`, keep deps
+download_and_copy_dependencies()
+
 setup(
     name=os.environ.get("TRITON_WHEEL_NAME", "triton"),
     version=TRITON_VERSION,
