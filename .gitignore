@@ -5,6 +5,7 @@ python/triton/_C/libtriton/
 
 .clangd
 triton-shared
+llvm-triton
 
 # pixi environments
 .pixi/*
