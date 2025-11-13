@@ -110,6 +110,34 @@ def _get_path_to_hip_runtime_dylib():
                 return f
             paths.append(f)
 
+    # HIP_PATH should point to HIP SDK root if set
+    env_hip_path = os.getenv("HIP_PATH")
+    if env_hip_path:
+        hip_lib_path = os.path.join(env_hip_path, "lib", lib_name)
+        if os.path.exists(hip_lib_path):
+            return hip_lib_path
+        paths.append(hip_lib_path)
+
+    # if available, `hipconfig --path` prints the HIP SDK root
+    try:
+        hip_root = subprocess.check_output(["hipconfig", "--path"]).decode().strip()
+        if hip_root:
+            hip_lib_path = os.path.join(hip_root, "lib", lib_name)
+            if os.path.exists(hip_lib_path):
+                return hip_lib_path
+            paths.append(hip_lib_path)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # hipconfig may not be available
+        pass
+
+    # ROCm lib dir based on env var
+    env_rocm_path = os.getenv("ROCM_PATH")
+    if env_rocm_path:
+        rocm_lib_path = os.path.join(env_rocm_path, "lib", lib_name)
+        if os.path.exists(rocm_lib_path):
+            return rocm_lib_path
+        paths.append(rocm_lib_path)
+
     # Afterwards try to search the loader dynamic library resolution paths.
     libs = subprocess.check_output(["/sbin/ldconfig", "-p"]).decode(errors="ignore")
     # each line looks like the following:
@@ -204,6 +232,7 @@ def make_launcher(constants, signature, warp_size):
                 output.append("*" + dtype)
                 for _ in range(2 * ndim):
                     output.append("i64")
+                output.append("i1")
                 # Currently the host side tensor descriptors get passed in as a
                 # tensor desc, shape, and strides. We have no way to use these
                 # shape and strides when processing tensor descriptors which is
@@ -411,7 +440,7 @@ static inline void gpuAssert(hipError_t code, const char *file, int line)
 
 #define HIP_CHECK(ans) {{ gpuAssert((ans), __FILE__, __LINE__); }}
 
-static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, hipStream_t stream, hipFunction_t function, hipDeviceptr_t profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
+static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int shared_memory, hipStream_t stream, hipFunction_t function, hipDeviceptr_t profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
   hipDeviceptr_t global_scratch = 0;
   void *params[] = {{ {', '.join(params)} }};
   if (gridX*gridY*gridZ > 0 && launch_cooperative_grid) {{
@@ -519,8 +548,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   {' '.join(float_storage_decls)}
 
   // extract kernel metadata
-  int num_warps, num_ctas, shared_memory, clusterDimX, clusterDimY, clusterDimZ;
-  if (!PyArg_ParseTuple(kernel_metadata, \"iiiiii\", &num_warps, &num_ctas, &shared_memory, &clusterDimX, &clusterDimY, &clusterDimZ)) {{
+  int num_warps, num_ctas, shared_memory;
+  if (!PyArg_ParseTuple(kernel_metadata, \"iii\", &num_warps, &num_ctas, &shared_memory)) {{
     return NULL;
   }}
   // extract launch metadata
@@ -542,7 +571,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (hipStream_t)_stream, (hipFunction_t)_function, (hipDeviceptr_t)profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, shared_memory, (hipStream_t)_stream, (hipFunction_t)_function, (hipDeviceptr_t)profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
 
   if(launch_exit_hook != Py_None){{
     PyObject* ret = PyObject_CallOneArg(launch_exit_hook, launch_metadata);
@@ -606,7 +635,7 @@ def wrap_handle_tensor_descriptor(launcher):
                 # descriptors which is why we provide our own decomposition
                 # above. Sadly this means we have to pass the shape and strides
                 # twice.
-                final_args.extend([arg.base, *arg.shape, *arg.strides, *arg.shape, *arg.strides])
+                final_args.extend([arg.base, *arg.shape, *arg.strides, arg.padding == "nan", *arg.shape, *arg.strides])
             else:
                 final_args.append(arg)
         return launcher(*meta_args, *final_args)
