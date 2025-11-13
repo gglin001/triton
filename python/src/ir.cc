@@ -1786,17 +1786,15 @@ void init_triton_ir(py::module &&m) {
              }
              if (haveDump) {
                context->disableMultithreading();
-              //  auto printingFlags = OpPrintingFlags();
-              //  printingFlags.elideLargeElementsAttrs(16);
-              //  printingFlags.enableDebugInfo();
-              //  std::string funcToDumpDir =
-              //      triton::tools::getStrEnv("MLIR_ENABLE_DUMP_DIR");
-              //  if (!funcToDumpDir.empty()) {
-              //    funcToDumpDir +=
-              //        "__" + std::to_string(MLIR_ENABLE_DUMP_DIR_IDX);
-              //    MLIR_ENABLE_DUMP_DIR_IDX += 1;
-              //  }
                auto printingFlags = getOpPrintingFlags();
+               printingFlags.elideLargeElementsAttrs(16);
+               std::string funcToDumpDir =
+                   triton::tools::getStrEnv("MLIR_ENABLE_DUMP_DIR");
+               if (!funcToDumpDir.empty()) {
+                 funcToDumpDir +=
+                     "__" + std::to_string(MLIR_ENABLE_DUMP_DIR_IDX);
+                 MLIR_ENABLE_DUMP_DIR_IDX += 1;
+               }
                auto printAlways = [funcToDump](Pass *, Operation *op) -> bool {
                  if (funcToDump.empty())
                    return true;
@@ -1810,13 +1808,23 @@ void init_triton_ir(py::module &&m) {
 
                  return false;
                };
-               self.enableIRPrinting(
-                   /*shouldPrintBeforePass=*/printAlways,
-                   /*shouldPrintAfterPass=*/printAlways,
-                   /*printModuleScope=*/true,
-                   /*printAfterOnlyOnChange=*/false,
-                   /*printAfterOnlyOnFailure*/ true, mlir_dumps_or_dbgs(),
-                   printingFlags);
+               if (funcToDumpDir.empty()) {
+                 self.enableIRPrinting(
+                     /*shouldPrintBeforePass=*/printAlways,
+                     /*shouldPrintAfterPass=*/printAlways,
+                     /*printModuleScope=*/true,
+                     /*printAfterOnlyOnChange=*/false,
+                     /*printAfterOnlyOnFailure*/ true, mlir_dumps_or_dbgs(),
+                     printingFlags);
+               } else {
+                 self.enableIRPrintingToFileTree(
+                     /*shouldPrintBeforePass=*/printAlways,
+                     /*shouldPrintAfterPass=*/printAlways,
+                     /*printModuleScope=*/true,
+                     /*printAfterOnlyOnChange=*/false,
+                     /*printAfterOnlyOnFailure*/ false,
+                     /*printTreeDir*/ funcToDumpDir, printingFlags);
+               }
              }
              return haveDump;
            })
