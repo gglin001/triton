@@ -5,6 +5,7 @@
       "name": "osx",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
+      "description": "linux with mold",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install",
@@ -25,6 +26,16 @@
         "LLVM_SYSPATH": "${sourceDir}/llvm-triton/llvm-project/build",
         "TRITON_WHEEL_DIR": "${sourceDir}/build/bin",
         "LLVM_ENABLE_ASSERTIONS": true
+      }
+    },
+    {
+      "name": "osx_lld",
+      "inherits": "osx",
+      "description": "macos with lld",
+      "cacheVariables": {
+        "CMAKE_SYSROOT": "",
+        "CMAKE_LINKER_TYPE": "LLD",
+        "Python3_EXECUTABLE": "${sourceDir}/.pixi/envs/default/bin/python"
       }
     },
     {
