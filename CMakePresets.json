@@ -35,6 +35,7 @@
       "cacheVariables": {
         "CMAKE_SYSROOT": "",
         "CMAKE_LINKER_TYPE": "LLD",
+        "TRITON_PLUGIN_DIRS": "${sourceDir}/triton-shared",
         "Python3_EXECUTABLE": "${sourceDir}/.pixi/envs/default/bin/python"
       }
     },
