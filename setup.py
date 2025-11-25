@@ -405,7 +405,7 @@ class CMakeBuild(build_ext):
         build_ext.finalize_options(self)
 
     def run(self):
-        download_and_copy_dependencies()
+        # download_and_copy_dependencies()
 
         try:
             out = subprocess.check_output(["cmake", "--version"])
@@ -822,7 +822,7 @@ PYTHON_CLASSIFIERS = [
 CLASSIFIERS = BASE_CLASSIFIERS + PYTHON_CLASSIFIERS
 
 # disable `ext_modules`, keep deps
-download_and_copy_dependencies()
+# download_and_copy_dependencies()
 
 setup(
     name=os.environ.get("TRITON_WHEEL_NAME", "triton"),
