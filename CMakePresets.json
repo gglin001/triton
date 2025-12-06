@@ -48,6 +48,15 @@
         "ROCTRACER_INCLUDE_DIR": "${sourceDir}/third_party/amd/backend/include",
         "JSON_INCLUDE_DIR": "${sourceDir}/.pixi/envs/default/include"
       }
+    },
+    {
+      "name": "osx_pixi",
+      "inherits": "osx",
+      "description": "linux with mold and pixi",
+      "cacheVariables": {
+        "CMAKE_SYSROOT": "$env{CONDA_BUILD_SYSROOT}",
+        "CMAKE_PREFIX_PATH": "$env{CMAKE_PREFIX_PATH}"
+      }
     }
   ]
 }
