@@ -154,7 +154,8 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
-        return target.backend == 'cuda'
+        # return target.backend == 'cuda'
+        return target.backend in ('cuda', 'cpu')
 
     def _parse_arch(self, arch):
         pattern = r"^sm(\d+)$"
