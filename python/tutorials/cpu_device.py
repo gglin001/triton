@@ -8,6 +8,14 @@ from triton.backends.driver import GPUDriver
 from triton.backends import nvidia
 
 
+TRITON_MOCK_PTX_VERSION = 87
+TRITON_MOCK_WARP_SIZE = 32
+TRITON_MOCK_ARCH = 90
+
+os.environ["TRITON_ALWAYS_COMPILE"] = "1"
+os.environ["TRITON_MOCK_PTX_VERSION"] = f"{TRITON_MOCK_PTX_VERSION}"
+
+
 class FakeCUDABackend(nvidia.compiler.CUDABackend):
     @staticmethod
     def supports_target(target: GPUTarget):
@@ -26,7 +34,7 @@ class FakeCudaDriver(GPUDriver):
 
     def get_current_target(self):
         warp_size = 32
-        capability = 0
+        capability = TRITON_MOCK_ARCH
         return GPUTarget("cpu", capability, warp_size)
 
     def get_active_torch_device(self):
@@ -66,8 +74,6 @@ nvidia.compiler.CUDABackend = FakeCUDABackend  # noqa
 nvidia.compiler.supports_target = FakeCUDABackend.supports_target  # noqa
 nvidia.driver.CudaDriver = FakeCudaDriver  # noqa
 
-
-os.environ["TRITON_ALWAYS_COMPILE"] = "1"
 triton.runtime.driver.set_active(FakeCudaDriver())
 
 device = "cpu"
