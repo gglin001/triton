@@ -70,6 +70,9 @@ def ptx_get_version(cuda_version) -> int:
 
 def get_ptx_version_from_options(options, arch: int):
     ptx_version = options.ptx_version
+    mock_ver = knobs.nvidia.mock_ptx_version
+    if mock_ver is not None:
+        return int(mock_ver)
     if ptx_version is None:
         cuda_version = get_ptxas(arch).version
         ptx_version = ptx_get_version(cuda_version)
