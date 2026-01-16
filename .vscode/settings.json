@@ -12,8 +12,4 @@
     },
     "mlir.server_path": "${workspaceFolder}/build/bin/triton-lsp",
     "mlir.tablegen_server_path": "${workspaceFolder}/llvm-triton/llvm-project/build/bin/tblgen-lsp-server",
-    // "search.useIgnoreFiles": false,
-    "search.exclude": {
-        "llvm-triton": true,
-    },
 }
