@@ -162,13 +162,7 @@ void ScopeIdAllocation::reachability() {
   DenseMap<VirtualBlock, BlockInfo> outputBlockInfoMap;
 
   std::deque<VirtualBlock> virtualBlockList;
-  funcOp->walk<WalkOrder::PreOrder>([&](Block *block) {
-    // Seed the worklist with entry blocks of regions that are
-    // isolated-from-above.
-    if (block->isEntryBlock() &&
-        !isa<RegionBranchOpInterface>(block->getParentOp()))
-      virtualBlockList.emplace_back(block, Block::iterator());
-  });
+  virtualBlockList.emplace_back(&funcOp.getBlocks().front(), Block::iterator());
 
   while (!virtualBlockList.empty()) {
     VirtualBlock virtualBlock = virtualBlockList.front();
@@ -242,6 +236,7 @@ void ScopeIdAllocation::reachability() {
 void ScopeIdAllocation::dominance() {
   // Stage 3: derive scope parentage and verify dominance constraints.
   mlir::DominanceInfo domInfo(funcOp);
+  mlir::PostDominanceInfo postDomInfo(funcOp);
   llvm::DenseMap<ScopeId, Operation *> startRecordMap;
   llvm::DenseMap<ScopeId, Operation *> endRecordMap;
   funcOp->walk<WalkOrder::PreOrder>([&](RecordOp recordOp) {
@@ -277,7 +272,7 @@ void ScopeIdAllocation::dominance() {
       auto parentScopeId = opToIdMap.lookup(parentStartOp);
       auto parentEndOp = endRecordMap.lookup(parentScopeId);
       if (domInfo.dominates(parentStartOp, startOp) &&
-          domInfo.dominates(endOp, parentEndOp)) {
+          postDomInfo.postDominates(parentEndOp, endOp)) {
         auto parentId = opToIdMap.lookup(parentStartOp);
         auto childId = opToIdMap.lookup(startOp);
         scopeParentIds.push_back({childId, parentId});

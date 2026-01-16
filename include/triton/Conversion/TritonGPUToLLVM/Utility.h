@@ -436,6 +436,9 @@ Value linearize(RewriterBase &rewriter, Location loc, ArrayRef<Value> multiDim,
 Value linearize(RewriterBase &rewriter, Location loc, ArrayRef<Value> multiDim,
                 ArrayRef<unsigned> shape);
 
+Value linearize(RewriterBase &rewriter, Location loc, ArrayRef<Value> multiDim,
+                triton::gpu::LinearEncodingAttr encoding, StringAttr dimName);
+
 size_t linearize(ArrayRef<unsigned> multiDim, ArrayRef<unsigned> shape,
                  ArrayRef<unsigned> order);
 
@@ -469,6 +472,10 @@ Value mxfpScaleBf16(RewriterBase &rewriter, Location loc, Value v, Value scale,
 // -----------------------------------------------------------------------
 
 // If an operation is contained within a warp specialize region, this returns
+// the warp ID offset of that warpgroup.
+std::optional<int> getWarpGroupStartWarpId(Block *block);
+
+// If an operation is contained within a warp specialize region, this returns
 // the thread ID offset of that warpgroup.
 std::optional<int> getWarpGroupStartThreadId(Block *block);
 
@@ -489,7 +496,6 @@ using ::mlir::LLVM::delinearize;
 using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
 using ::mlir::triton::gpu::AMDWmmaEncodingAttr;
 using ::mlir::triton::gpu::BlockedEncodingAttr;
-using ::mlir::triton::gpu::CTALayoutAttr;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
 using ::mlir::triton::gpu::NvidiaMmaEncodingAttr;
 using ::mlir::triton::gpu::SliceEncodingAttr;
@@ -629,6 +635,16 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
                                  Value threadPred,
                                  const TargetInfoBase &targetInfo,
                                  const LLVMTypeConverter *typeConverter);
+
+// -----------------------------------------------------------------------
+// FuncOp conversion utilities
+// -----------------------------------------------------------------------
+void filterFuncAttributes(triton::FuncOp op, bool filterArgAttrs,
+                          SmallVectorImpl<NamedAttribute> &result);
+triton::FuncOp amendFuncOp(triton::FuncOp funcOp,
+                           ConversionPatternRewriter &rewriter,
+                           const TargetInfoBase &targetInfo);
+void handleArgPtrDatatype(triton::FuncOp funcOp, LLVM::LLVMFuncOp &llvmFuncOp);
 } // namespace mlir
 
 #endif

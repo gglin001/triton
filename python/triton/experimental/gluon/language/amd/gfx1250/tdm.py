@@ -10,7 +10,9 @@ if TYPE_CHECKING:
     from triton._C import ir
     from triton.experimental.gluon.language._core import shared_memory_descriptor
 
-__all__ = ["async_load", "async_wait", "make_tensor_descriptor", "tensor_descriptor", "tensor_descriptor_type"]
+__all__ = [
+    "async_load", "async_wait", "make_tensor_descriptor", "tensor_descriptor", "tensor_descriptor_type", "prefetch"
+]
 
 
 @dataclass(eq=True)
@@ -98,8 +100,7 @@ def make_tensor_descriptor(base: ttgl.tensor, shape: List[ttgl.constexpr | ttgl.
         tensor_descriptor: the created tensor descriptor object
     """
     ndim = len(shape)
-    # TODO: support 1D-5D tensor descriptors
-    assert ndim == 2, f"Expected 2 dimensions but got {ndim} dimensions"
+    assert 1 <= ndim <= 5, f"Expected 1 <= ndim <= 5 but got {ndim} dimensions"
     assert len(strides) == ndim, f"Expected {ndim} strides but got {len(strides)}"
     assert len(block_shape) == ndim, f"Expected block_shape to have {ndim} dimensions but got {len(strides)}"
     assert isinstance(base.dtype, ttgl.pointer_type), "Expected base to be a pointer"
@@ -128,33 +129,40 @@ def make_tensor_descriptor(base: ttgl.tensor, shape: List[ttgl.constexpr | ttgl.
 
 @builtin
 def async_load(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tensor], dest: shared_memory_descriptor,
-               mbarrier: shared_memory_descriptor = None, _semantic=None) -> None:
+               pred: bool = True, mbarrier: shared_memory_descriptor = None, _semantic=None) -> None:
     """Load a block of tensor specified in tensor descriptor from global memory to shared memory asynchronously.
 
     Args:
         src (tensor_descriptor): the source tensor descriptor.
         offsets (List[int]): the offsets from the base pointer in the tensor descriptor.
         dest (shared_memory_descriptor): the shared memory destination to store the loaded data.
+        pred (bool, optional): Predicate to enable or disable the load. Defaults to True.
         mbarrier (shared_memory_descriptor, optional): The barrier object to signal "arrive" on.
     """
     offset_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    pred = _semantic.to_tensor(pred)
+    pred_handle = pred.handle
     mbarrier = _unwrap_if_constexpr(mbarrier)
     mbarrier_handle = mbarrier.handle if mbarrier is not None else ttgl.ir.value()
-    _semantic.builder.create_async_tdm_copy_global_to_local(src.handle, offset_handles, dest.handle, mbarrier_handle)
+    _semantic.builder.create_async_tdm_copy_global_to_local(src.handle, offset_handles, dest.handle, pred_handle,
+                                                            mbarrier_handle)
 
 
 @builtin
 def async_store(dest: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tensor], src: shared_memory_descriptor,
-                _semantic=None) -> None:
+                mbarrier: shared_memory_descriptor = None, _semantic=None) -> None:
     """Store a block of tensor specified in tensor descriptor from shared memory to global memory asynchronously.
 
     Args:
         dest (tensor_descriptor): the destination tensor descriptor.
         offsets (List[int]): the offsets from the base pointer in the tensor descriptor.
         src (shared_memory_descriptor): the shared memory source to load the data.
+        mbarrier (shared_memory_descriptor, optional): The barrier object to signal "arrive" on.
     """
     offset_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    _semantic.builder.create_async_tdm_copy_local_to_global(dest.handle, offset_handles, src.handle)
+    mbarrier = _unwrap_if_constexpr(mbarrier)
+    mbarrier_handle = mbarrier.handle if mbarrier is not None else ttgl.ir.value()
+    _semantic.builder.create_async_tdm_copy_local_to_global(dest.handle, offset_handles, src.handle, mbarrier_handle)
 
 
 @builtin
@@ -166,3 +174,38 @@ def async_wait(num_outstanding=0, _semantic=None) -> None:
     """
     num_outstanding = _unwrap_if_constexpr(num_outstanding)
     _semantic.builder.create_async_tdm_wait(num_outstanding)
+
+
+@builtin
+def prefetch(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tensor], pred: bool = True,
+             speculative: bool = False, _semantic=None) -> None:
+    """Prefetches a block of tensor specified in tensor descriptor from global memory into L2. Speculative prefetches can generate more
+    efficient assembly because they do not require out of bounds checks. However, they are dropped by the hardware if their virtual address translation is not cached.
+    So speculative should only be set if previous iterations have accessed the same virtual page (e.g. column major)
+    Args:
+        src (tensor_descriptor): the source tensor descriptor.
+        offsets (List[int]): the offsets from the base pointer in the tensor descriptor.
+        pred (bool, optional): Predicate to enable or disable the prefetch. Defaults to True.
+        speculative (bool, optional): Whether the prefetch is speculative. Defaults to False.
+    """
+    offset_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    pred = _semantic.to_tensor(pred)
+    pred_handle = pred.handle
+    speculative = _unwrap_if_constexpr(speculative)
+    _semantic.builder.create_tdm_prefetch(src.handle, offset_handles, pred_handle, speculative, False)
+
+
+@builtin
+def _test_prefetch_with_offsets(src: tensor_descriptor, offsets: List[ttgl.constexpr | ttgl.tensor], pred: bool = True,
+                                speculative: bool = False, _semantic=None) -> ttgl.tensor:
+    """Test-only prefetch variant that returns offsets for validation."""
+    offset_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    pred = _semantic.to_tensor(pred)
+    pred_handle = pred.handle
+    speculative = _unwrap_if_constexpr(speculative)
+    handle = _semantic.builder.create_tdm_prefetch(src.handle, offset_handles, pred_handle, speculative, True)
+    shape = _semantic.builder.get_shape_from_tensor(handle)
+    layout = _semantic.builder.get_gluon_layout_from_tensor(handle)
+    ret_ty = ttgl.distributed_type(ttgl.int64, shape, layout)
+    tensor = ttgl.tensor(handle, ret_ty)
+    return tensor

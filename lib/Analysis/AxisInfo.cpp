@@ -1,6 +1,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -149,8 +150,6 @@ private:
       unsigned firstIndex) override {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       visitForOpInductionVar(forOp, argLattices);
-    } else if (auto ws = dyn_cast<gpu::WarpSpecializePartitionsOp>(op)) {
-      visitWarpSpecializeExplicitCaptures(ws, successor, argLattices);
     } else {
       setAllToEntryStates(argLattices.take_front(firstIndex));
       setAllToEntryStates(argLattices.drop_front(
@@ -171,10 +170,6 @@ public:
   void
   visitForOpInductionVar(scf::ForOp op,
                          ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices);
-
-  void visitWarpSpecializeExplicitCaptures(
-      gpu::WarpSpecializePartitionsOp ws, const RegionSuccessor &successor,
-      ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices);
 };
 
 template <typename OpTy>
@@ -1037,7 +1032,8 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver,
                   CastOpAxisInfoVisitor<arith::ExtUIOp>,
                   CastOpAxisInfoVisitor<arith::TruncIOp>,
                   CastOpAxisInfoVisitor<triton::gpu::ConvertLayoutOp>,
-                  CastOpAxisInfoVisitor<triton::BitcastOp>>();
+                  CastOpAxisInfoVisitor<triton::BitcastOp>,
+                  CastOpAxisInfoVisitor<triton::gluon::SetAutoLayoutOp>>();
   visitors.append<MakeRangeOpAxisInfoVisitor>();
   visitors.append<PoisonOpAxisInfoVisitor>();
   visitors.append<ConstantOpAxisInfoVisitor>();
@@ -1073,11 +1069,10 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver,
 LogicalResult AxisInfoAnalysis::visitOperation(
     Operation *op, ArrayRef<const dataflow::Lattice<AxisInfo> *> operands,
     ArrayRef<dataflow::Lattice<AxisInfo> *> results) {
-  // TODO: For sure not the right way to do this
-  // but why is scf.if not initialized otherwise?
+  // If any operands are not yet ready, skip this operation for now.
   for (auto op : operands)
     if (op->getValue().getRank() == 0)
-      setToEntryState((dataflow::Lattice<AxisInfo> *)op);
+      return success();
   AxisInfo curr = visitors.apply(op, operands);
   if (curr.getRank() == 0) {
     setAllToEntryStates(results);
@@ -1106,9 +1101,11 @@ void AxisInfoAnalysis::visitForOpInductionVar(
   ProgramPoint *programPoint = getProgramPointAfter(op);
   auto *lbLattice = getLatticeElementFor(programPoint, op.getLowerBound());
   auto *stepLattice = getLatticeElementFor(programPoint, op.getStep());
-  for (auto op_iter : {lbLattice, stepLattice})
-    if (op_iter->getValue().getRank() == 0)
-      setToEntryState((dataflow::Lattice<AxisInfo> *)op_iter);
+  // If lb or step is not yet ready, skip this operation for now.
+  if (lbLattice->getValue().getRank() == 0 ||
+      stepLattice->getValue().getRank() == 0) {
+    return;
+  }
 
   AxisInfo::DimVectorT knownContiguity(1, 1);
   AxisInfo::DimVectorT knownDivisibility(1, 1);
@@ -1118,20 +1115,6 @@ void AxisInfoAnalysis::visitForOpInductionVar(
   auto inductionVar =
       AxisInfo(knownContiguity, knownDivisibility, knownConstancy);
   (void)argLattices[0]->join(inductionVar);
-}
-
-void AxisInfoAnalysis::visitWarpSpecializeExplicitCaptures(
-    gpu::WarpSpecializePartitionsOp ws, const RegionSuccessor &successor,
-    ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices) {
-  assert(!successor.isParent());
-  ProgramPoint *point = getProgramPointAfter(ws);
-
-  for (auto [capture, argLattice] :
-       llvm::zip(ws.getParentOp().getExplicitCaptures(), argLattices)) {
-    propagateIfChanged(
-        argLattice,
-        argLattice->join(getLatticeElementFor(point, capture)->getValue()));
-  }
 }
 
 } // anonymous namespace
@@ -1182,24 +1165,8 @@ void AxisInfo::initDimVectorFromHint(Attribute attr, DimVectorT *vec) {
       initPessimisticStateFromFunc(blockArg.getArgNumber(), fun,
                                    &knownContiguity, &knownDivisibility,
                                    &knownConstancy);
-    } else if (isa<RegionBranchOpInterface, gpu::WarpSpecializePartitionsOp>(
-                   op)) {
-      // scf::ForOp, scf::IfOp, scf::WhileOp, gpu::WarpSpecializePartitionsOp
-      // Control flow operations are initialized with "unknown" state:
-      // the maximum possible divisibility, contiguity, and constancy.
-      knownDivisibility = DimVectorT(rank, kMaxDivisor);
-      knownConstancy = DimVectorT(rank, kMaxDivisor);
-      knownContiguity = DimVectorT(rank, kMaxDivisor);
     }
   } else if (Operation *op = value.getDefiningOp()) {
-    if (isa<RegionBranchOpInterface>(op)) {
-      // scf::ForOp, scf::IfOp, scf::WhileOp
-      // Control flow operations are initialized with "unknown" state:
-      // the maximum possible divisibility, contiguity, and constancy.
-      knownDivisibility = DimVectorT(rank, kMaxDivisor);
-      knownConstancy = DimVectorT(rank, kMaxDivisor);
-      knownContiguity = DimVectorT(rank, kMaxDivisor);
-    }
     // Other operations are conservatively initialized with the lowest possible
     // divisibility, contiguity, and constancy unless they have specified.
     AxisInfo::initDimVectorFromHint(op->getDiscardableAttr("tt.divisibility"),
@@ -1337,28 +1304,18 @@ void ModuleAxisInfoAnalysis::initialize(FunctionOpInterface funcOp,
                                         axisinfo::CallbackType callback) {
   std::unique_ptr<DataFlowSolver> solver = createDataFlowSolver();
   AxisInfoAnalysis *analysis = solver->load<AxisInfoAnalysis>(callback);
-  // Walk pre-order so analysis results can be propagated into nested isolated
-  // regions.
-  WalkResult result =
-      funcOp.walk<mlir::WalkOrder::PreOrder>([&](Operation *op) {
-        if (op->hasTrait<OpTrait::IsIsolatedFromAbove>() &&
-            failed(solver->initializeAndRun(op)))
-          return WalkResult::interrupt();
-        return WalkResult::advance();
-      });
-  if (result.wasInterrupted())
+  if (failed(solver->initializeAndRun(funcOp)))
     return;
 
   auto *axisInfoMap = getFuncData(funcOp);
   auto updateAxisInfoMap = [&](Value value) {
     auto axisInfo = analysis->getLatticeElement(value)->getValue();
-    AxisInfo curAxisInfo;
-    if (axisInfoMap->count(value)) {
-      curAxisInfo = AxisInfo::join(axisInfo, axisInfoMap->lookup(value));
-    } else {
-      curAxisInfo = axisInfo;
-    }
-    (*axisInfoMap)[value] = curAxisInfo;
+    // If we could not determine the AxisInfo for this value, assume the
+    // pessimistic state.
+    if (axisInfo.getRank() == 0)
+      axisInfo = AxisInfo::getPessimisticValueState(value);
+    auto &valInfo = (*axisInfoMap)[value];
+    valInfo = AxisInfo::join(axisInfo, valInfo);
   };
   funcOp.walk([&](Operation *op) {
     for (auto value : op->getResults()) {
