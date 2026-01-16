@@ -47,6 +47,6 @@ llnl-hatchet = ">=2025.1.0, <2026"
 
 [activation.env]
 # needs llvm-triton
-PATH = "${PWD}/build/bin:${PWD}/llvm-triton/llvm-project/build/bin:${PATH}"
+PATH = "${PIXI_PROJECT_ROOT}/build/bin:${PIXI_PROJECT_ROOT}/llvm-triton/llvm-project/build/bin:${PATH}"
 # only needed on macos
 # CMAKE_PREFIX_PATH = "${CONDA_PREFIX}"
