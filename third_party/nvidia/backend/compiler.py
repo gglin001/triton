@@ -161,7 +161,7 @@ class CUDABackend(BaseBackend):
     def supports_target(target: GPUTarget):
         if os.environ.get("TRITON_MOCK_PTX_VERSION", None):
             return target.backend in ('cuda', 'cpu')
-        return target.backend == 'cuda'        
+        return target.backend == 'cuda'
 
     def _parse_arch(self, arch):
         pattern = r"^sm(\d+)$"
