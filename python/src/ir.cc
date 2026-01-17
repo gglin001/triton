@@ -1896,6 +1896,10 @@ void init_triton_ir(py::module &&m) {
 
                  return false;
                };
+               auto printAlwaysNo = [funcToDump](Pass *,
+                                                 Operation *op) -> bool {
+                 return false;
+               };
                if (funcToDumpDir.empty()) {
                  self.enableIRPrinting(
                      /*shouldPrintBeforePass=*/printAlways,
@@ -1906,7 +1910,8 @@ void init_triton_ir(py::module &&m) {
                      printingFlags);
                } else {
                  self.enableIRPrintingToFileTree(
-                     /*shouldPrintBeforePass=*/printAlways,
+                     /*shouldPrintBeforePass=*/printAlwaysNo,
+                     //  /*shouldPrintBeforePass=*/printAlways,
                      /*shouldPrintAfterPass=*/printAlways,
                      /*printModuleScope=*/true,
                      /*printAfterOnlyOnChange=*/false,
