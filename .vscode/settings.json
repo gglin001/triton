@@ -1,15 +1,14 @@
 {
-    // "files.insertFinalNewline": false,
-    // "files.trimTrailingWhitespace": false,
-    "terminal.integrated.env.linux": {
-        "EXT_PATH": "${workspaceFolder}/build/bin",
-    },
-    "terminal.integrated.env.osx": {
-        "PATH": "${workspaceFolder}/build/bin:${env:PATH}",
-        // "EXT_PATH": "${workspaceFolder}/build/bin",
-        //
-        // "TRITON_MOCK_PTX_VERSION": "89",
-    },
-    "mlir.server_path": "${workspaceFolder}/build/bin/triton-lsp",
-    "mlir.tablegen_server_path": "${workspaceFolder}/llvm-triton/llvm-project/build/bin/tblgen-lsp-server",
+  // "files.insertFinalNewline": false,
+  // "files.trimTrailingWhitespace": false,
+  "mlir.server_path": "${workspaceFolder}/build/bin/triton-lsp",
+  "mlir.tablegen_server_path": "${workspaceFolder}/llvm-triton/llvm-project/build/bin/tblgen-lsp-server",
+  "terminal.integrated.env.linux": {
+    "EXT_PATH": "${workspaceFolder}/build/bin",
+  },
+  "terminal.integrated.env.osx": {
+    "PATH": "${workspaceFolder}/build/bin:${env:PATH}",
+    // "EXT_PATH": "${workspaceFolder}/build/bin",
+    // "TRITON_MOCK_PTX_VERSION": "89",
+  },
 }
