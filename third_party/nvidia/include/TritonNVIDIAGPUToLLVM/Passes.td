@@ -2,7 +2,6 @@
 #define TRITONGPU_CONVERSION_PASSES
 
 include "mlir/Pass/PassBase.td"
-include "mlir/Rewrite/PassUtil.td"
 
 def ConvertTritonGPUToLLVM : Pass<"convert-triton-gpu-to-llvm", "mlir::ModuleOp"> {
     let summary = "Convert TritonGPU to LLVM";
@@ -28,7 +27,7 @@ def ConvertTritonGPUToLLVM : Pass<"convert-triton-gpu-to-llvm", "mlir::ModuleOp"
         Option<"ptxVersion", "ptx-version",
                "int32_t", /*default*/"80",
                "PTX version">,
-    ] # RewritePassUtils.options;
+    ];
 }
 def AllocateSharedMemoryNv : Pass<"allocate-shared-memory-nv", "mlir::ModuleOp"> {
   let summary = "Add metadata for shared memory allocation for Nvidia";

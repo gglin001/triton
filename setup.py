@@ -569,7 +569,6 @@ PYTHON_CLASSIFIERS = [
 ]
 CLASSIFIERS = BASE_CLASSIFIERS + PYTHON_CLASSIFIERS
 
-
 setup(
     name=os.environ.get("TRITON_WHEEL_NAME", "triton"),
     version=TRITON_VERSION,

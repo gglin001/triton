@@ -1895,8 +1895,8 @@ void init_triton_ir(py::module &&m) {
                      /*shouldPrintAfterPass=*/printAlways,
                      /*printModuleScope=*/true,
                      /*printAfterOnlyOnChange=*/false,
-                     /*printAfterOnlyOnFailure*/ true, mlir_dumps_or_dbgs(),
-                     printingFlags);
+                     /*printAfterOnlyOnFailure*/ true,
+                     ::mlir::triton::tools::mlirDumpsOrDbgs(), printingFlags);
                } else {
                  self.enableIRPrintingToFileTree(
                      /*shouldPrintBeforePass=*/printAlwaysNo,

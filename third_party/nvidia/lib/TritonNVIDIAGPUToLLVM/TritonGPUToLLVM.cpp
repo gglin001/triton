@@ -84,22 +84,6 @@ struct ConvertTritonGPUToLLVM
   ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion)
       : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion}) {}
 
-  ConvertTritonGPUToLLVM(int32_t computeCapability,
-                         ArrayRef<std::string> disabledPatterns,
-                         ArrayRef<std::string> enabledPatterns)
-      : ConvertTritonGPUToLLVMBase({computeCapability}) {
-    this->disabledPatterns = disabledPatterns;
-    this->enabledPatterns = enabledPatterns;
-  }
-
-  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
-                         ArrayRef<std::string> disabledPatterns,
-                         ArrayRef<std::string> enabledPatterns)
-      : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion}) {
-    this->disabledPatterns = disabledPatterns;
-    this->enabledPatterns = enabledPatterns;
-  }
-
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
