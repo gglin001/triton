@@ -12,10 +12,12 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_FLAGS": "-Wno-error=deprecated-declarations",
         "CMAKE_SYSROOT": "/",
         "CMAKE_LINKER_TYPE": "MOLD",
         "CMAKE_INSTALL_RPATH_USE_LINK_PATH": true,
         "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/bin",
+        "LLVM_SYSPATH": "${sourceDir}/llvm-triton/llvm-project/build",
         "LLVM_DIR": "${sourceDir}/llvm-triton/llvm-project/build/lib/cmake/llvm",
         "MLIR_DIR": "${sourceDir}/llvm-triton/llvm-project/build/lib/cmake/mlir",
         "LLD_DIR": "${sourceDir}/llvm-triton/llvm-project/build/lib/cmake/lld",
@@ -23,8 +25,8 @@
         "TRITON_BUILD_UT": false,
         "TRITON_CODEGEN_BACKENDS": "nvidia;amd",
         "TRITON_BUILD_PYTHON_MODULE": true,
-        "LLVM_SYSPATH": "${sourceDir}/llvm-triton/llvm-project/build",
         "TRITON_WHEEL_DIR": "${sourceDir}/build/bin",
+        "TRITON_CACHE_PATH": "${sourceDir}/build",
         "LLVM_ENABLE_ASSERTIONS": true
       }
     },
@@ -44,7 +46,7 @@
         "TRITON_BUILD_PROTON": true,
         "CUPTI_INCLUDE_DIR": "${sourceDir}/third_party/nvidia/backend/include",
         "ROCTRACER_INCLUDE_DIR": "${sourceDir}/third_party/amd/backend/include",
-        "JSON_INCLUDE_DIR": "${sourceDir}/.pixi/envs/default/include"
+        "JSON_SYSPATH": "${sourceDir}/.pixi/envs/default"
       }
     },
     {
