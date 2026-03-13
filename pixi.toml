@@ -8,6 +8,7 @@ version = "0.1.0"
 [tasks]
 
 [system-requirements]
+# CONDA_OVERRIDE_CUDA=12.9 pixi i -v
 cuda = "12.9"
 
 [dependencies]
@@ -37,6 +38,7 @@ pytorch = "2.8.*"
 boost = ">=1.85.0,<2"
 llvm-openmp = ">=21.1.8,<22"
 
+# TODO: update versions
 [target.linux-64.dependencies]
 cusparselt = ">=0.8.0.4,<0.9"
 # pixi add cuda-version=12.9 cuda-toolkit=12.9.1 -p linux-64
