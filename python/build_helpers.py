@@ -486,10 +486,10 @@ def main(argv=None):
 
     parsed_args = parser.parse_args(argv)
     helper_args = normalize_parsed_args(parsed_args)
-    if parsed_args.command == "download_and_copy_dependencies":
-        download_and_copy_dependencies(helper_args)
-    elif parsed_args.command == "write_thirdparty_cmake_vars":
-        write_thirdparty_cmake_vars(output=parsed_args.output, packages=parsed_args.packages, helper_args=helper_args)
+    # if parsed_args.command == "download_and_copy_dependencies":
+    #     download_and_copy_dependencies(helper_args)
+    # elif parsed_args.command == "write_thirdparty_cmake_vars":
+    #     write_thirdparty_cmake_vars(output=parsed_args.output, packages=parsed_args.packages, helper_args=helper_args)
 
 
 if __name__ == "__main__":
