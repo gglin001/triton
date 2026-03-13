@@ -1,9 +1,10 @@
-from dataclasses import dataclass
-from typing import Optional
 import inspect
 import re
 import textwrap
 import types
+from dataclasses import dataclass
+from typing import Optional
+
 import triton
 
 
@@ -142,7 +143,8 @@ def specialize(fn, module, constants, tuples, name=None, do_not_specialize=tuple
         for spec_fn in spec_fns.values():
             spec_repr = spec_fn.repr(None)
             if spec_repr:
-                spec_repr = spec_repr.strip("_")
+                # Avoid dots in the appended repr so kernel name keeps the base kernel's name.
+                spec_repr = spec_repr.rsplit(".", 1)[-1].strip("_")
             if spec_repr:
                 ret += f"_{spec_repr}"
         return ret
@@ -155,13 +157,18 @@ def specialize(fn, module, constants, tuples, name=None, do_not_specialize=tuple
 
     # Reuse the original kernel's metadata so that stack traces and other
     # source-based tooling report the correct file and line numbers.
+    adjust_line_number = lambda line_num: max(1, line_num - line_delta)
+
     ret.raw_src = list(fn.raw_src)
-    adjusted_start = max(1, fn.starting_line_number - line_delta)
-    ret.starting_line_number = adjusted_start
+    ret.starting_line_number = adjust_line_number(fn.starting_line_number)
+    ret.def_file_line_number = adjust_line_number(fn.def_file_line_number)
+    ret.def_file_col_number = fn.def_file_col_number
+
     orig_code = fn.fn.__code__
+    ret.file_name = orig_code.co_filename
     ret.fn.__code__ = ret.fn.__code__.replace(
         co_filename=orig_code.co_filename,
-        co_firstlineno=max(1, orig_code.co_firstlineno - line_delta),
+        co_firstlineno=adjust_line_number(orig_code.co_firstlineno),
     )
     return ret
 
@@ -181,8 +188,8 @@ class SpecializationModule:
         self._modules = dict()
 
     def get(self, **kwargs):
-        import types
         import sys
+        import types
         specs = [FnSpecs.default()] * len(self.closure_args)
         for key, value in kwargs.items():
             specs[list(self.closure_args.keys()).index(key)] = value

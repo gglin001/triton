@@ -27,15 +27,9 @@ SmallVector<Value> lowerLocalScGt(Location loc, MLIRContext *ctx,
   bool isScatter = !storeVals.empty();
 
   // Get the shared memory layout (linear component for padded layouts)
-  auto sharedEnc =
-      cast<triton::gpu::SharedEncodingTrait>(memDescTy.getEncoding());
-  auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
-  LinearLayout sharedLayout;
-  if (paddedEnc) {
-    sharedLayout = paddedEnc.getLinearComponent();
-  } else {
-    sharedLayout = toLinearLayout(memDescTy);
-  }
+  auto sharedLayout = isPaddedEncoding(memDescTy.getEncoding())
+                          ? paddedLinearLayout(memDescTy)
+                          : toLinearLayout(memDescTy);
   LinearLayout invSharedLayout = sharedLayout.invert();
 
   // Get layout dimension names for all dims
@@ -101,13 +95,13 @@ SmallVector<Value> lowerLocalScGt(Location loc, MLIRContext *ctx,
 
     // Add padding offset for padded layouts (non-linear component)
     Value ptr;
-    if (paddedEnc) {
+    if (isPaddedEncoding(memDescTy.getEncoding())) {
       // Convert offset to bytes for padding calculation
       Value offsetBytes = b.mul(offset, b.i32_val(bitwidth / 8));
-      Value padOffset = emitPadding(loc, rewriter, paddedEnc, bitwidth,
-                                    offsetBytes, /*offsetInBytes=*/true);
+      auto shifts = getPaddedSharedShifts(memDescTy.getEncoding(), bitwidth,
+                                          /*offsetInBytes=*/true);
       // GEP in bytes: base + offset*elemSize + padOffset
-      Value totalOffset = b.add(offsetBytes, padOffset);
+      Value totalOffset = applyPadding(loc, rewriter, offsetBytes, shifts);
       ptr = b.gep(smemObj.getBase().getType(), i8_ty, smemObj.getBase(),
                   totalOffset);
     } else {
@@ -134,27 +128,17 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
   auto regTy = cast<RankedTensorType>(regVal.getType());
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
 
-  auto kReg = str_attr("register");
-  auto kLane = str_attr("lane");
-  auto kWarp = str_attr("warp");
-  auto kOffset = str_attr("offset");
   auto regLayout = toLinearLayout(regTy);
-  auto paddedEnc =
-      dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(memDescTy.getEncoding());
-  LinearLayout cvt = LinearLayout::empty();
-  if (paddedEnc) {
-    const auto &sharedLL = paddedEnc.getLinearComponent();
-    cvt = regLayout.invertAndCompose(sharedLL);
-  } else {
-    auto sharedLayout = toLinearLayout(memDescTy);
-    cvt = regLayout.invertAndCompose(sharedLayout);
-  }
+  auto sharedLayout = isPaddedEncoding(memDescTy.getEncoding())
+                          ? paddedLinearLayout(memDescTy)
+                          : toLinearLayout(memDescTy);
+  auto cvt = regLayout.invertAndCompose(sharedLayout);
+
   auto kBlock = str_attr("block");
-  // NYI. We would need to emit a map.shared::cluster instruction.
+  // We could support it by removing this check if we ever want to
   if (!cvt.isTrivialOver({kBlock})) {
     return failure();
   }
-  cvt = cvt.sublayout({kReg, kLane, kWarp}, {kOffset});
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
                  rewriter, targetInfo);
 
@@ -185,8 +169,11 @@ struct GlobalScratchAllocOpConversion
     if (!funcOp) {
       return failure();
     }
-    Value ptr = LLVM::getGlobalScratchPtr(loc, rewriter, *targetInfo, funcOp,
-                                          b.i32_val(opOffset));
+    Value ptr = op->hasAttr("third_party_allocation")
+                    ? LLVM::getProfileScratchPtr(loc, rewriter, *targetInfo,
+                                                 funcOp, b.i32_val(opOffset))
+                    : LLVM::getGlobalScratchPtr(loc, rewriter, *targetInfo,
+                                                funcOp, b.i32_val(opOffset));
 
     rewriter.replaceOp(op, ptr);
     return success();
@@ -207,14 +194,16 @@ struct LocalAllocOpConversion
     if (!op.isSharedMemoryAlloc())
       return failure();
     Location loc = op->getLoc();
-    Value smemBase =
-        LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
+    // Get all shared memory bases (one for non-partitioned, multiple for
+    // partitioned tensors)
+    SmallVector<Value> smemBases = LLVM::getSharedMemoryBases(
+        loc, rewriter, targetInfo, op.getOperation());
     auto memDescTy = cast<MemDescType>(op.getType());
     auto typeConverter = getTypeConverter();
 
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
-    auto smemObj = SharedMemoryObject(smemBase, llvmElemTy, memDescTy.getRank(),
-                                      loc, rewriter);
+    auto smemObj = SharedMemoryObject(smemBases, llvmElemTy,
+                                      memDescTy.getRank(), loc, rewriter);
     // If there is an initial tensor, store it into the shared memory.
     if (op.getSrc()) {
       auto *ctx = op.getContext();
@@ -270,28 +259,17 @@ public:
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                          llvmElemTy, rewriter);
 
-    auto sharedEnc =
-        cast<triton::gpu::SharedEncodingTrait>(memDescTy.getEncoding());
-    auto kReg = str_attr("register");
-    auto kLane = str_attr("lane");
-    auto kWarp = str_attr("warp");
-    auto kOffset = str_attr("offset");
     auto regLayout = toLinearLayout(regTy);
-    auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
-    LinearLayout cvt = LinearLayout::empty();
-    if (paddedEnc) {
-      const auto &sharedLL = paddedEnc.getLinearComponent();
-      cvt = regLayout.invertAndCompose(sharedLL);
-    } else {
-      auto sharedLayout = toLinearLayout(memDescTy);
-      cvt = regLayout.invertAndCompose(sharedLayout);
-    }
+    auto sharedLayout = isPaddedEncoding(memDescTy.getEncoding())
+                            ? paddedLinearLayout(memDescTy)
+                            : toLinearLayout(memDescTy);
+    auto cvt = regLayout.invertAndCompose(sharedLayout);
+
     auto kBlock = str_attr("block");
-    // NYI. We would need to emit a map.shared::cluster instruction.
+    // We could support it by removing this check if we ever want to
     if (!cvt.isTrivialOver({kBlock})) {
       return failure();
     }
-    cvt = cvt.sublayout({kReg, kLane, kWarp}, {kOffset});
 
     auto outVals = lowerLocalLdSt(loc, ctx, cvt, {}, llvmElemTy, memDescTy,
                                   smemObj, rewriter, targetInfo, op);
@@ -344,6 +322,22 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
+class BarrierOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::BarrierOp> {
+public:
+  BarrierOpConversion(const LLVMTypeConverter &converter,
+                      PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::gpu::BarrierOp>(converter, benefit) {}
+  using OpAdaptor = typename triton::gpu::BarrierOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::BarrierOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<mlir::gpu::BarrierOp>(op);
+    return success();
+  }
+};
+
 struct LocalGatherOpConversion : public ConvertOpToLLVMPattern<LocalGatherOp> {
 public:
   LocalGatherOpConversion(LLVMTypeConverter &typeConverter,
@@ -358,6 +352,13 @@ public:
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getSrc().getType());
+    // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
+    // PRs.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
+            memDescTy.getEncoding())) {
+      return rewriter.notifyMatchFailure(
+          op, "PartitionedSharedEncoding not yet supported in lowering");
+    }
     auto regTy = cast<RankedTensorType>(op.getType());
     auto typeConverter = getTypeConverter();
 
@@ -400,6 +401,13 @@ public:
     auto loc = op.getLoc();
     auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getDst().getType());
+    // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
+    // PRs.
+    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
+            memDescTy.getEncoding())) {
+      return rewriter.notifyMatchFailure(
+          op, "PartitionedSharedEncoding not yet supported in lowering");
+    }
     auto valuesTy = cast<RankedTensorType>(op.getValues().getType());
     auto typeConverter = getTypeConverter();
 
@@ -425,26 +433,6 @@ public:
 private:
   const TargetInfoBase &targetInfo;
 };
-
-class LocalBarrierOpConversion
-    : public ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp> {
-public:
-  LocalBarrierOpConversion(const LLVMTypeConverter &converter,
-                           PatternBenefit benefit)
-      : ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp>(converter,
-                                                            benefit) {}
-  using OpAdaptor = typename triton::gpu::LocalBarrierOp::Adaptor;
-
-  LogicalResult
-  matchAndRewrite(triton::gpu::LocalBarrierOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-
-    rewriter.replaceOpWithNewOp<mlir::gpu::BarrierOp>(op);
-
-    return success();
-  }
-};
-
 } // namespace
 
 void mlir::triton::populateMemoryOpToLLVMPatterns(
@@ -458,5 +446,5 @@ void mlir::triton::populateMemoryOpToLLVMPatterns(
   patterns.add<LocalGatherOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalScatterOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<LocalBarrierOpConversion>(typeConverter, benefit);
+  patterns.add<BarrierOpConversion>(typeConverter, benefit);
 }

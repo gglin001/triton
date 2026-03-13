@@ -15,7 +15,7 @@ tt.func @cast() {
 
 // -----
 
-tt.func @add() {
+tt.func @add(%arg0: tensor<128xi32> {tt.contiguity = 1 : i32, tt.divisibility = 4 : i32, tt.constancy = 2: i32}, %arg1: tensor<128xi32> {tt.contiguity = 4 : i32, tt.divisibility = 4 : i32, tt.constancy = 1: i32}) {
   // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
   %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [128], constant_value = 1}}
@@ -26,6 +26,30 @@ tt.func @add() {
   %3 = arith.constant dense<127> : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [128], constancy = [128], constant_value = 128}}
   %4 = arith.addi %1, %3 : tensor<128xi32>
+  // Contiguous + contiguous can overestimate divisibility if we only take
+  // gcd(divisibility) (divisibility is defined on contiguity-group bases).
+  // expected-remark @below {{contiguity = [1], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %5 = arith.addi %0, %0 : tensor<128xi32>
+  // expected-remark @below {{contiguity = [128], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %odd = tt.make_range {end = 129 : i32, start = 1 : i32} : tensor<128xi32>
+  // Contiguous + contiguous with different base parity yields an odd sequence.
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %even_plus_odd = arith.addi %0, %odd : tensor<128xi32>
+  // Contiguous + contiguous with odd bases may yield an even sequence but we still conservatively estimate the
+  // divisibility as 1.
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %odd_plus_odd = arith.addi %odd, %odd : tensor<128xi32>
+  // Partial constant + contiguous. The resultant contiguity is smaller than the operands'.
+  // [4, 4, 8, 8, 12, 12, ...] + [0, 1, 2, 3, 4, 5, ...]
+  // expected-remark @below {{contiguity = [2], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %9 = arith.addi %0, %arg0 : tensor<128xi32>
+  // Partial contiguous + partial contiguous can also overestimate divisibility.
+  // [0, 1, 2, 3, 0, 1, 2, 3, ...] + [0, 1, 2, 3, 0, 1, 2, 3, ...]
+  // expected-remark @below {{contiguity = [1], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %11 = arith.addi %arg1, %arg1 : tensor<128xi32>
+  // Partial constant + partial constant.
+  // expected-remark @below {{contiguity = [1], divisibility = [4], constancy = [2], constant_value = <none>}}
+  %12 = arith.addi %arg0, %arg0 : tensor<128xi32>
   tt.return
 }
 
@@ -87,7 +111,7 @@ tt.func @addptr(%arg0: !tt.ptr<i1> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<
 
 // -----
 
-tt.func @sub() {
+tt.func @sub(%arg0: tensor<128xi32> {tt.contiguity = 1 : i32, tt.divisibility = 4 : i32, tt.constancy = 2: i32}, %arg1: tensor<128xi32> {tt.contiguity = 4 : i32, tt.divisibility = 4 : i32, tt.constancy = 1: i32}) {
   // expected-remark @below {{contiguity = [128], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
   %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [128], constant_value = 1}}
@@ -100,6 +124,40 @@ tt.func @sub() {
   %4 = arith.constant dense<129> : tensor<128xi32>
   // expected-remark @below {{contiguity = [1], divisibility = [128], constancy = [128], constant_value = 128}}
   %5 = arith.subi %4, %1 : tensor<128xi32>
+  // Result contiguity depends on RHS constancy for subi; ensure divisibility is
+  // clamped when result contiguity is smaller than operand contiguity.
+  // expected-remark @below {{contiguity = [128], divisibility = [16], constancy = [1], constant_value = <none>}}
+  %rhs_range = tt.make_range {end = 144 : i32, start = 16 : i32} : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [16], constancy = [1], constant_value = <none>}}
+  %sub_clamp = arith.subi %0, %rhs_range : tensor<128xi32>
+  // Both operands are contiguous, but with different contiguity groups. In this
+  // case, we conservatively infer divisibility from parity: even - even is
+  // divisible by 2.
+  // expected-remark @below {{contiguity = [1], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %even_even_diff_contig = arith.subi %0, %arg1 : tensor<128xi32>
+  // expected-remark @below {{contiguity = [4], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %arg1_plus_one = arith.addi %arg1, %1 : tensor<128xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1073741824], constancy = [1], constant_value = <none>}}
+  %6 = arith.subi %0, %0 : tensor<128xi32>
+  // expected-remark @below {{contiguity = [128], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %odd = tt.make_range {end = 129 : i32, start = 1 : i32} : tensor<128xi32>
+  // Contiguous - contiguous with different base parity yields an odd constant.
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %even_minus_odd = arith.subi %0, %odd : tensor<128xi32>
+  // Contiguous - contiguous. With both only odd divisibilities.
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %odd_minus_arg1_plus_one = arith.subi %odd, %arg1_plus_one : tensor<128xi32>
+  // Partial constant - contiguous. The resultant contiguity is smaller than the LHS'.
+  // [0, 1, 2, 3, 4, 5, ...] - [4, 4, 8, 8, 12, 12, ...]
+  // expected-remark @below {{contiguity = [2], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %7 = arith.subi %0, %arg0 : tensor<128xi32>
+  // Same contiguity - shortcut optimization for divisibility
+  // [4, 5, 6, 7, 4, 5, 6, 7, ...] - [4, 5, 6, 7, 4, 5, 6, 7, ...]
+  // expected-remark @below {{contiguity = [1], divisibility = [4], constancy = [1], constant_value = <none>}}
+  %8 = arith.subi %arg1, %arg1 : tensor<128xi32>
+  // Partial constant - partial constant.
+  // expected-remark @below {{contiguity = [1], divisibility = [4], constancy = [2], constant_value = <none>}}
+  %9 = arith.subi %arg0, %arg0 : tensor<128xi32>
   tt.return
 }
 
@@ -226,6 +284,54 @@ tt.func @expanddims() {
   %2 = arith.muli %0, %1 : tensor<128xi32>
   // expected-remark @below {{contiguity = [1, 1], divisibility = [2, 2], constancy = [1, 1], constant_value = <none>}}
   %3 = tt.expand_dims %2 {axis = 1 : i32} : tensor<128xi32> -> tensor<128x1xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @reshape(%arg0: tensor<8xi32> {tt.contiguity = 1 : i32, tt.divisibility = 8 : i32, tt.constancy = 4 : i32}) {
+  // expected-remark @below {{contiguity = [4], divisibility = [4], constancy = [1], constant_value = <none>}}
+  %0 = tt.make_range {end = 8 : i32, start = 4 : i32} : tensor<4xi32>
+  // expected-remark @below {{contiguity = [1, 1, 4], divisibility = [1, 1, 4], constancy = [1, 1, 1], constant_value = <none>}}
+  %1 = tt.reshape %0 : tensor<4xi32> -> tensor<1x1x4xi32>
+  // expected-remark @below {{contiguity = [16], divisibility = [4], constancy = [1], constant_value = <none>}}
+  %2 = tt.make_range {end = 20 : i32, start = 4 : i32} : tensor<16xi32>
+  // expected-remark @below {{contiguity = [1, 4], divisibility = [1, 4], constancy = [1, 1], constant_value = <none>}}
+  %3 = tt.reshape %2 : tensor<16xi32> -> tensor<4x4xi32>
+  // expected-remark @below {{contiguity = [4], divisibility = [4], constancy = [1], constant_value = <none>}}
+  %4 = tt.reshape %3 : tensor<4x4xi32> -> tensor<16xi32>
+  // expected-remark @below {{contiguity = [4, 1], divisibility = [4, 1], constancy = [1, 1], constant_value = <none>}}
+  %5 = tt.trans %3 {order = array<i32: 1, 0>} : tensor<4x4xi32> -> tensor<4x4xi32>
+  // expected-remark @below {{contiguity = [1, 2, 1], divisibility = [1, 2, 1], constancy = [1, 1, 1], constant_value = <none>}}
+  %6 = tt.reshape %5 : tensor<4x4xi32> -> tensor<2x2x4xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %7 = tt.reshape %5 : tensor<4x4xi32> -> tensor<16xi32>
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [8, 8], constancy = [2, 2], constant_value = <none>}}
+  %8 = tt.reshape %arg0 : tensor<8xi32> -> tensor<4x2xi32>
+  // expected-remark @below {{contiguity = [8], divisibility = [16], constancy = [1], constant_value = <none>}}
+  %9 = tt.make_range {end = 24 : i32, start = 16 : i32} : tensor<8xi32>
+  // expected-remark @below {{contiguity = [1, 8], divisibility = [1, 16], constancy = [1, 1], constant_value = <none>}}
+  %10 = tt.reshape %9 : tensor<8xi32> -> tensor<1x8xi32>
+  // expected-remark @below {{contiguity = [4], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %11 = tt.make_range {end = 5 : i32, start = 1 : i32} : tensor<4xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [2], constancy = [4], constant_value = 2}}
+  %12 = arith.constant dense<2> : tensor<4xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %13 = arith.muli %11, %12 : tensor<4xi32>
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [2, 2], constancy = [1, 1], constant_value = <none>}}
+  %14 = tt.reshape %13 : tensor<4xi32> -> tensor<1x4xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @reshape_refined_piece_merge(
+    %arg0: tensor<4x4xi32> {tt.contiguity = dense<[1, 1]> : tensor<2xi32>, tt.divisibility = dense<[1, 1]> : tensor<2xi32>, tt.constancy = dense<[2, 4]> : tensor<2xi32>},
+    %arg1: tensor<2x2x2xi32> {tt.contiguity = dense<[1, 1, 2]> : tensor<3xi32>, tt.divisibility = dense<[1, 1, 1]> : tensor<3xi32>, tt.constancy = dense<[2, 2, 1]> : tensor<3xi32>}) {
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [8], constant_value = <none>}}
+  %0 = tt.reshape %arg0 : tensor<4x4xi32> -> tensor<16xi32>
+  // expected-remark @below {{contiguity = [1, 2], divisibility = [1, 1], constancy = [4, 1], constant_value = <none>}}
+  %1 = tt.reshape %arg1 : tensor<2x2x2xi32> -> tensor<4x2xi32>
   tt.return
 }
 
@@ -846,15 +952,6 @@ tt.func @call_graph(%arg0: i32) {
 }
 
 }
-
-// -----
-
-tt.func @tensor_ptr(%arg0: !tt.ptr<tensor<64x16xi32>, 1>) {
-  // expected-remark @below {{contiguity = [1, 1], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
-  %0 = tt.load %arg0 : !tt.ptr<tensor<64x16xi32>, 1>
-  tt.return
-}
-
 
 // -----
 

@@ -125,7 +125,10 @@ class PrecisionConfig:
 # TODO: merge in opt_flags
 def get_swap_xw(precision_config, opt_flags):
     if target_info.cuda_capability_geq(10, 0):
-        return precision_config.b_mx_scale is not None and opt_flags.block_m <= 64 and opt_flags.is_persistent
+        if precision_config.b_mx_scale is not None:
+            return opt_flags.block_m <= 64 and opt_flags.is_persistent
+        else:
+            return opt_flags.block_m < 64 and opt_flags.is_persistent
     elif target_info.cuda_capability_geq(9, 0):
         b_scale_layout = None if not isinstance(precision_config.b_mx_scale, Tensor) else precision_config.b_mx_scale.storage.layout
         return isinstance(b_scale_layout, HopperMXScaleLayout)
@@ -404,8 +407,10 @@ def matmul(a, b, bias,
     if ragged_dimension == "M":
         grid_m = a_ragged_metadata.n_blocks(a_ragged_metadata.n_slices, M, opt_flags.block_m)
     grid_n = triton.cdiv(N, opt_flags.block_n)
-    max_grid = batch_size * grid_m * grid_n * opt_flags.split_k
-    grid = min(target_info.num_sms() - opt_flags.idle_sms, max_grid) if opt_flags.is_persistent else max_grid
+    grid = batch_size * grid_m * grid_n * opt_flags.split_k
+    if opt_flags.is_persistent:
+        available_sms = target_info.num_sms() - opt_flags.idle_sms
+        grid = min(opt_flags.occupancy_target * available_sms, grid)
     # canonicalize storage
     has_scatter_tma = scatter_indx is not None and target_info.has_tma_gather()
     c = wrap_torch_tensor(out_matmul.view(math.prod(out_matmul.shape[:-1]), out_matmul.shape[-1]) if has_scatter else out_matmul.view(math.prod(out_matmul.shape[:-2]), *out_matmul.shape[-2:]))
@@ -426,6 +431,8 @@ def matmul(a, b, bias,
     a_tma_block_size = [1, opt_flags.block_k] if has_gather_tma else [1, opt_flags.block_m, opt_flags.block_k]
     a_tma_mode = None if not a_has_tma else "ragged" if ragged_dimension == "M" and not has_gather_tma else "dense"
     a_tensor_or_tma = make_tma(a, a_tma_block_size, a_tma_mode) if a_has_tma else a.storage.data
+    if a_has_tma and precision_config.allow_tf32 and a.storage.data.dtype == torch.float32:
+        a_tensor_or_tma.round_f32_to_tf32 = True
     # create tma descriptor for y
     c_has_tma = (
         opt_flags.is_persistent and (scatter_indx is None or has_scatter_tma)
@@ -439,6 +446,8 @@ def matmul(a, b, bias,
     # create tma descriptor for w
     b_has_tma = opt_flags.is_persistent
     b_tensor_or_tma = make_tma(b, [1, opt_flags.block_k, opt_flags.block_n], "dense") if b_has_tma else b.storage.data
+    if b_has_tma and precision_config.allow_tf32 and b.storage.data.dtype == torch.float32:
+        b_tensor_or_tma.round_f32_to_tf32 = True
     # create tma descriptor for w_scale
     b_scale_has_tma = opt_flags.is_persistent and b_scale is not None
     b_transpose = b.storage.data.stride()[-2] == 1

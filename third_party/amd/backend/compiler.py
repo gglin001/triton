@@ -4,6 +4,7 @@ from triton import knobs
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 from types import ModuleType
+import os
 import hashlib
 import tempfile
 import re
@@ -29,6 +30,10 @@ def is_in_thread_transpose_enabled(arch):
 
 def is_async_copy_enabled(arch):
     return (arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy
+
+
+def is_fpsan_supported(arch):
+    return arch in ["gfx942", "gfx950", "gfx1250"]
 
 
 @dataclass(frozen=True)
@@ -164,14 +169,27 @@ class HIPBackend(BaseBackend):
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.load_dialects(ctx)
 
+    # is_within_2gb() needs to check for a torch subobject and this var tracks torch
+    # availability state: None - not tested, True - torch is present. Anything else -
+    # no torch available. First call to is_within_2gb() checks torch availability
+    # and caches it.
+    _torch_available: None | bool = None
+
     @staticmethod
     def is_within_2gb(arg):
-        import torch
+        if HIPBackend._torch_available is None:
+            try:
+                import torch
+                HIPBackend._torch_available = True
+            except ImportError:
+                HIPBackend._torch_available = False
+        elif HIPBackend._torch_available:
+            import torch
 
         MAX_INT_32 = 2**31 - 1
         if hasattr(arg, "ptr_range"):
             return arg.ptr_range() <= MAX_INT_32
-        if isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage"):
+        if HIPBackend._torch_available and isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage"):
             return arg.untyped_storage().size() <= MAX_INT_32
         return False
 
@@ -194,8 +212,8 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
-        passes.ttir.add_rewrite_tensor_pointer(pm)
-        passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
+        if not amd.supports_tdm(options.arch):
+            passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
@@ -239,6 +257,7 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
         if use_async_copy:
             amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
+        amd.passes.ttgpuir.add_convert_to_tensor_ops(pm)
         passes.common.add_canonicalizer(pm)
         if options.schedule_hint.lower() != "none":
             for hint in options.schedule_hint.split(","):
@@ -248,7 +267,7 @@ class HIPBackend(BaseBackend):
         if is_in_thread_transpose_enabled(options.arch):
             amd.passes.ttgpuir.add_in_thread_transpose(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm)
-        amd.passes.ttgpuir.add_reorder_instructions(pm)
+        amd.passes.ttgpuir.add_move_up_prologue_loads(pm)
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
 
@@ -261,11 +280,15 @@ class HIPBackend(BaseBackend):
                 knobs.amd.use_buffer_atomics,
                 knobs.amd.buffer_ops_analyze_small_tensor_range,
             )
+            amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
 
         amd.passes.ttgpuir.add_fold_true_cmpi(pm)
+        amd.passes.ttgpuir.add_prepare_if_combining(pm)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
+        if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):
+            passes.ttgpuir.add_fp_sanitizer(pm)
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
@@ -285,6 +308,9 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
 
+        if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):
+            passes.ttgpuir.add_fp_sanitizer(pm)
+
         pm.run(mod, 'gluon_to_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
@@ -296,15 +322,17 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
-        amd.passes.ttgpuir.add_warp_pipeline_conversion(pm)
+        amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
 
         amd.passes.ttgpuir.add_allocate_shared_memory(pm)
+        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
+        passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
         ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
         ##    of the value of kernel arg `allow_flush_denorm`.
@@ -334,7 +362,7 @@ class HIPBackend(BaseBackend):
         if not knobs.compilation.disable_line_info and not knobs.compilation.dump_ir_extract_di_local_variables:
             passes.llvmir.add_di_scope(pm)
 
-        amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, __HIP_FTZ)
+        amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
         pm.run(mod, 'make_llir')
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
@@ -378,6 +406,8 @@ class HIPBackend(BaseBackend):
         fns = [fn for fn in llvm_mod.get_functions() if not fn.is_declaration()]
         # The public kernel should be kernel 0.
         fns[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
+        cluster_dim = metadata["num_ctas"]
+        fns[0].add_fn_attr("amdgpu-cluster-dims", f"{cluster_dim},1,1")
         # warp-specialization mutates num_warps
         total_warps_num = options.num_warps
         total_num_warps = src.get_int_attr("ttg.total-num-warps")
@@ -406,7 +436,9 @@ class HIPBackend(BaseBackend):
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments
         # from memory.
-        if options.arch != "gfx1250":
+        # TODO(tyb0807): Disabled when using MIR swap/dump because the value is
+        # not serializable to/from MIR YAML
+        if options.arch != "gfx1250" and not (knobs.amd.swap_mir or knobs.amd.dump_mir):
             amd.set_all_fn_arg_inreg(fns[0])
 
         if knobs.compilation.enable_asan:
@@ -439,6 +471,8 @@ class HIPBackend(BaseBackend):
         # Get some metadata
         metadata["num_warps"] = total_warps_num
         metadata["shared"] = src.get_int_attr("ttg.shared")
+        metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
+        metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
         metadata["profile_scratch_align"] = src.get_int_attr("ttg.profile_scratch_memory_alignment") or 1
 
@@ -465,8 +499,15 @@ class HIPBackend(BaseBackend):
                                   dump_file_id)
         llvm.dump_sched_dag(src, amd.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
                             dump_file_id)
-        amdgcn = llvm.translate_to_asm(src, amd.TARGET_TRIPLE, options.arch, features, flags, options.enable_fp_fusion,
-                                       False)
+        if knobs.amd.swap_mir_enable_misched and not knobs.amd.swap_mir:
+            raise ValueError("TRITON_SWAP_MIR_ENABLE_MISCHED requires TRITON_SWAP_MIR to be set")
+        if knobs.amd.swap_mir:
+            amdgcn = llvm.translate_mir_to_asm(os.path.join(knobs.amd.swap_mir, dump_file_id + '.txt'),
+                                               amd.TARGET_TRIPLE, options.arch, features, flags,
+                                               options.enable_fp_fusion, False, knobs.amd.swap_mir_enable_misched)
+        else:
+            amdgcn = llvm.translate_to_asm(src, amd.TARGET_TRIPLE, options.arch, features, flags,
+                                           options.enable_fp_fusion, False)
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
@@ -477,6 +518,8 @@ class HIPBackend(BaseBackend):
         target_features = ''
         if knobs.compilation.enable_asan:
             target_features = '+xnack'
+        if 'gfx11' in options.arch:
+            target_features += ',-real-true16'
         hsaco = amd.assemble_amdgcn(src, options.arch, target_features)
         with tempfile.NamedTemporaryFile() as tmp_out:
             with tempfile.NamedTemporaryFile() as tmp_in:

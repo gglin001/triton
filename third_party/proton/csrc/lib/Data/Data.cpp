@@ -9,39 +9,132 @@
 
 namespace proton {
 
+void DataEntry::upsertMetric(std::unique_ptr<Metric> metric) const {
+  auto &metrics = metricSet.get().metrics;
+  auto it = metrics.find(metric->getKind());
+  if (it == metrics.end()) {
+    metrics.emplace(metric->getKind(), std::move(metric));
+  } else {
+    it->second->updateMetric(*metric);
+  }
+}
+
+void DataEntry::upsertLinkedMetric(std::unique_ptr<Metric> metric,
+                                   size_t linkedId) const {
+  auto &linkedMetrics = metricSet.get().linkedMetrics;
+  auto &linkedMetricMap = linkedMetrics[linkedId];
+  auto it = linkedMetricMap.find(metric->getKind());
+  if (it == linkedMetricMap.end()) {
+    linkedMetricMap.emplace(metric->getKind(), std::move(metric));
+  } else {
+    it->second->updateMetric(*metric);
+  }
+}
+
+void DataEntry::upsertFlexibleMetric(const std::string &metricName,
+                                     const MetricValueType &metricValue) const {
+  auto &flexibleMetrics = metricSet.get().flexibleMetrics;
+  auto it = flexibleMetrics.find(metricName);
+  if (it == flexibleMetrics.end()) {
+    flexibleMetrics.emplace(metricName,
+                            FlexibleMetric(metricName, metricValue));
+  } else {
+    it->second.updateValue(metricValue);
+  }
+}
+
+void DataEntry::upsertFlexibleMetrics(
+    const std::map<std::string, MetricValueType> &metrics) const {
+  for (const auto &[metricName, metricValue] : metrics) {
+    upsertFlexibleMetric(metricName, metricValue);
+  }
+}
+
+void DataEntry::upsertLinkedFlexibleMetric(const std::string &metricName,
+                                           const MetricValueType &metricValue,
+                                           size_t linkedId) const {
+  auto &linkedFlexibleMetrics = metricSet.get().linkedFlexibleMetrics;
+  auto &linkedFlexibleMetricMap = linkedFlexibleMetrics[linkedId];
+  auto it = linkedFlexibleMetricMap.find(metricName);
+  if (it == linkedFlexibleMetricMap.end()) {
+    linkedFlexibleMetricMap.emplace(metricName,
+                                    FlexibleMetric(metricName, metricValue));
+  } else {
+    it->second.updateValue(metricValue);
+  }
+}
+
+void DataEntry::upsertLinkedFlexibleMetrics(
+    const std::map<std::string, MetricValueType> &metrics,
+    size_t linkedId) const {
+  for (const auto &[metricName, metricValue] : metrics) {
+    upsertLinkedFlexibleMetric(metricName, metricValue, linkedId);
+  }
+}
+
 void Data::initPhaseStore(PhaseStoreBase &store) {
   phaseStore = &store;
-  currentPhasePtr = phaseStore->getOrCreatePtr(0);
+  currentPhasePtr = phaseStore->createPtr(0);
+  phaseStore->createPtr(kVirtualPhase);
   activePhases.insert(0);
+}
+
+DataEntry Data::addOp(const std::string &opName) {
+  std::vector<Context> contexts = contextSource->getContexts();
+  if (!opName.empty())
+    contexts.emplace_back(opName);
+  const auto phase = currentPhase.load(std::memory_order_relaxed);
+  return addOp(phase, kRootEntryId, contexts);
 }
 
 size_t Data::advancePhase() {
   std::unique_lock<std::shared_mutex> lock(mutex);
-  const auto nextPhase = currentPhase + 1;
-  currentPhasePtr = phaseStore->getOrCreatePtr(nextPhase);
+  const auto nextPhase = currentPhase.load(std::memory_order_relaxed) + 1;
+  currentPhasePtr = phaseStore->createPtr(nextPhase);
   activePhases.insert(nextPhase);
-  currentPhase = nextPhase;
-  return currentPhase;
+  currentPhase.store(nextPhase, std::memory_order_release);
+  return nextPhase;
 }
 
-void Data::clear(size_t phase) {
-  phaseStore->clearUpToInclusive(phase);
+void Data::clear(size_t phase, bool clearUpToPhase) {
+  // No locking needed.
+  // If phase == currentPhase, we expect users to call clear right after
+  // deactivating the profiler, without any GPU events in between.
+  // If phase < currentPhase, clearing a past phase is safe without locks.
+  if (clearUpToPhase)
+    phaseStore->clearUpToInclusive(phase);
+  else
+    phaseStore->clearPhase(phase);
+
   std::unique_lock<std::shared_mutex> lock(mutex);
-  currentPhasePtr = phaseStore->getOrCreatePtr(currentPhase);
-  activePhases.clear();
-  for (phase += 1; phase <= currentPhase; phase++)
-    activePhases.insert(phase);
+  if (clearUpToPhase) {
+    for (auto it = activePhases.begin(); it != activePhases.end();) {
+      if (*it <= phase) {
+        it = activePhases.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  } else {
+    activePhases.erase(phase);
+  }
+
+  // In case the current phase is cleared, recreate its pointer.
+  const auto phaseToRecreate = currentPhase.load(std::memory_order_relaxed);
+  currentPhasePtr = phaseStore->createPtr(phaseToRecreate);
+  activePhases.insert(phaseToRecreate);
 }
 
-void Data::updateFlushedPhase(size_t phase) {
+void Data::completePhase(size_t phase) {
   std::unique_lock<std::shared_mutex> lock(mutex);
-  if (flushedPhase == kNoFlushedPhase || phase > flushedPhase)
-    flushedPhase = phase;
+  if (completeUpToPhase == kNoCompletePhase || phase > completeUpToPhase)
+    completeUpToPhase = phase;
 }
 
-bool Data::isPhaseFlushed(size_t phase) const {
+Data::PhaseInfo Data::getPhaseInfo() const {
   std::shared_lock<std::shared_mutex> lock(mutex);
-  return flushedPhase != kNoFlushedPhase && flushedPhase >= phase;
+  return PhaseInfo{currentPhase.load(std::memory_order_relaxed),
+                   completeUpToPhase};
 }
 
 void Data::dump(const std::string &outputFormat) {
@@ -56,7 +149,9 @@ void Data::dump(const std::string &outputFormat) {
     if (path.empty() || path == "-") {
       out.reset(new std::ostream(std::cout.rdbuf())); // Redirecting to cout
     } else {
-      auto suffix = currentPhase == 0 ? "" : ".part_" + std::to_string(phase);
+      auto suffix = currentPhase.load(std::memory_order_relaxed) == 0
+                        ? ""
+                        : ".part_" + std::to_string(phase);
       const auto filePath =
           path + suffix + "." + outputFormatToString(outputFormatEnum);
       const auto fileMode =

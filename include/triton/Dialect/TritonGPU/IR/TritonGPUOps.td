@@ -2,9 +2,11 @@
 #define TRITONGPU_OPS
 
 include "triton/Dialect/TritonGPU/IR/TritonGPUDialect.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUEnums.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypes.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUTypeInterfaces.td"
 include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td"
+include "triton/Dialect/TritonGPU/IR/TritonGPUOpInterfaces.td"
 include "mlir/Dialect/Arith/IR/ArithBase.td"
 include "triton/Dialect/Triton/IR/TritonTypes.td"
 include "triton/Dialect/Triton/IR/TritonAttrDefs.td"
@@ -24,7 +26,7 @@ def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
 
 class TTG_Op<string mnemonic, list<Trait> traits = []> :
     Op<TritonGPU_Dialect, mnemonic,
-       !listconcat(traits, [VerifyTensorLayoutsTrait])> {
+       !listconcat(traits, [VerifyTensorLayoutsTrait, VerifyMemDescLayoutsTrait])> {
 }
 
 def TTG_ConvertLayoutOp : TTG_Op<"convert_layout",
@@ -270,7 +272,7 @@ def TTG_MemDescSubsliceOp : TTG_Op<"memdesc_subslice", [Pure, MemDescViewTrait]>
 def TTG_MemDescTransOp : TTG_Op<"memdesc_trans", [Pure,
                                                   MemDescViewTrait,
                                                   TransposeOpInterface,
-                                                  InferTypeOpWithLayoutEquivalence,
+                                                  InferMemDescTypeOpWithLayoutEquivalence,
                                                   SameOperandsAndResultElementType]> {
   let summary = "transpose the descriptor";
 
@@ -523,15 +525,14 @@ def TTG_GlobalScratchAllocOp : TTG_Op<"global_scratch_alloc"> {
   let summary = "allocate a global memory buffer";
   let description = [{
     This operation allocates a buffer in global memory that is private to the current program.
-    The `backend` attribute specifies the backend to use for allocation.
-    The `default` backend is used by TritonGPU passes.
-    Downstream Triton tools and compilers can register a different backend and use a different allocation policy.
+    A custom third-party allocation can be marked using the optional
+    `third_party_allocation` unit attribute.
   }];
   let arguments = (
     ins
     I32Attr:$nbytes,
     I32Attr:$alignment,
-    DefaultValuedAttr<StrAttr, "\"default\"">:$backend
+    OptionalAttr<UnitAttr>:$third_party_allocation
   );
   let results = (outs Arg<TT_Ptr, "", [MemAlloc<GlobalMemory>]>:$result);
 
@@ -540,7 +541,7 @@ def TTG_GlobalScratchAllocOp : TTG_Op<"global_scratch_alloc"> {
 
 def TTG_WarpSpecializeOp : TTG_Op<"warp_specialize", [
   RecursiveMemoryEffects, RecursivelySpeculatable, AsyncRegions,
-  DeclareOpInterfaceMethods<RegionBranchOpInterface>
+  DeclareOpInterfaceMethods<RegionBranchOpInterface, ["getSuccessorInputs"]>
 ]> {
   let summary = "asynchronously execute code on multiple warpgroups";
   let description = [{
@@ -592,8 +593,10 @@ def TTG_WarpSpecializeOp : TTG_Op<"warp_specialize", [
     RegionRange getPartitionRegions();
     WarpSpecializePartitionsOp getPartitionOp();
 
-    // Get the size and alignment of the capture list.
-    std::pair<uint64_t, uint64_t> getCaptureSizeAlign();
+    // Get the size of the capture list.
+    uint64_t getCaptureSize();
+    // Get the alignment of the capture list.
+    uint64_t getCaptureAlign();
     // Get the total number of extra warps required.
     unsigned getTotalPartitionWarps();
   }];
@@ -616,7 +619,8 @@ def TTG_WarpSpecializePartitionsOp
               RecursivelySpeculatable, Terminator,
               HasParent<"WarpSpecializeOp">,
               DeclareOpInterfaceMethods<
-                  RegionBranchOpInterface, ["getEntrySuccessorOperands"]>]> {
+                  RegionBranchOpInterface, ["getEntrySuccessorOperands",
+                                            "getSuccessorInputs"]>]> {
   let summary = "container op for `ttg.warp_specialize`";
   let description = [{
     Because MLIR requires entire operations be isolated from above, this op
@@ -668,23 +672,56 @@ def TTG_WarpReturnOp : TTG_Op<"warp_return", [
   let assemblyFormat = "attr-dict";
 }
 
-def TTG_LocalBarrierOp : TTG_Op<"local_barrier"> {
-  let summary = "Synchronizes execution and shared memory reads/writes for all threads in a CTA.";
+def TTG_BarrierOp : TTG_Op<"barrier"> {
+  let summary = "Synchronizes execution and reads/writes to the selected address spaces for all threads in the CTA.";
   let description = [{
-    The `local_barrier` op synchronizes the execution and all operations
-    between shared memory and registers for all threads in a CTA.
-    It is used to coordinate communication between the threads of the CTA.
+    The `barrier` op synchronises the execution and all operations between the selected address spaces for all
+    threads in the CTA. It is used to coordinate communication between threads in the CTA.
 
-    This operation waits until all threads in the CTA have reached a `local_barrier`
-    and operations between shared memory and registers made by these threads prior
-    to the op are visible to all threads in the CTA.
+    This operation waits until all threads in the CTA have reached a `barrier` (for syncronisation) and operations
+    between the selected address spaces made by these threads prior to the op are visible to all threads in the CTA.
 
-    Data hazards between threads accessing the same memory can be avoided by synchronizing the
-    CTA in-between these accesses with a `local_barrier`.
+    Data hazards between threads accessing the same memory can be avoided by synchronising the
+    specified scope in-between these accesses with a `barrier`.
 
-    A `local_barrier` operation does not provide syncronization guarantees on global memory.
+    A `barrier` operation only provides syncronisation and memory guarantees on the selected address spaces in the CTA.
+
+    The mandatory `addrspace` attribute is a bitmask describing which address spaces will be visible when the `barrier` completes:
+
+    * `none`         control-only syncronisation (no memory ordering).
+    * `local`        shared-memory operations are complete and visible CTA-wide.
+    * `global_read`  global memory reads are complete and visible CTA-wide.
+    * `global_write` global memory writes are complete and visible CTA-wide.
+    * `tensor_read`  tensor memory read operations are complete and visible CTA-wide.
+    * `tensor_write` tensor memory write operations are complete and visible CTA-wide.
+    * `all`          convenience alias for `["local", "global_read", "global_write", "tensor_read", "tensor_write"]`.
+
+    Multiple address spaces can be combined (e.g. `local|tensor_write`). `none` cannot be combined with other address spaces.
+
+    Example:
+
+    ```mlir
+    ttg.barrier local
+    ttg.barrier local|global_read|global_write
+    ```
   }];
-  let assemblyFormat = "attr-dict";
+
+  let arguments = (ins TTG_AddrSpace:$addrSpace);
+  let hasCustomAssemblyFormat = 1;
+
+  let extraClassDeclaration = [{
+    /// Returns true if the barrier includes all of the given address spaces.
+    /// For example, hasAddrSpaces(Local | GlobalRead) returns true only if
+    /// both Local and GlobalRead are set.
+    bool hasAddrSpace(AddrSpace space) {
+      return bitEnumContainsAll(getAddrSpace(), space);
+    }
+    bool hasLocal() { return hasAddrSpace(AddrSpace::Local); }
+    bool hasGlobalRead() { return hasAddrSpace(AddrSpace::GlobalRead); }
+    bool hasGlobalWrite() { return hasAddrSpace(AddrSpace::GlobalWrite); }
+    bool hasTensorRead() { return hasAddrSpace(AddrSpace::TensorRead); }
+    bool hasTensorWrite() { return hasAddrSpace(AddrSpace::TensorWrite); }
+  }];
 }
 
 def TTG_WarpIdOp : TTG_Op<"warp_id", [Pure]> {

@@ -191,18 +191,56 @@ void createTensorMemoryStore(Location loc, Value address, int colOffset,
   ptxBuilder.launch(rewriter, loc, voidTy);
 }
 
-Value createTensorMemoryLoad(Location loc, MLIRContext *ctx, Value address,
-                             int colOffset, std::optional<int> secondHalfOffset,
-                             bool unpacked, int numRegPerMessage,
-                             TMemAccessAtom atom,
-                             ConversionPatternRewriter &rewriter) {
+// Returns {loadResult, redvalResult} where redvalResult is null if no reduction
+std::pair<Value, Value>
+createTensorMemoryLoad(Location loc, MLIRContext *ctx, Value address,
+                       int colOffset, std::optional<int> secondHalfOffset,
+                       bool unpacked, int numRegPerMessage, TMemAccessAtom atom,
+                       std::optional<TMEMLoadReduceModifier> redOp, bool useAbs,
+                       bool useNaN, Type elemTy,
+                       ConversionPatternRewriter &rewriter) {
   PTXBuilder ptxBuilder;
   // If the memory is unpacked we need to pack on the fly when loading.
   std::string packedStr = unpacked ? ".pack::16b" : "";
   unsigned numRepeats = numRegPerMessage / getElementsPerThread(atom);
-  std::string opcode = "tcgen05.ld.sync.aligned.";
+
+  std::string opcode = std::string("tcgen05.ld.") + (redOp ? "red." : "");
+  opcode += "sync.aligned.";
   opcode += getOpShape(atom);
-  opcode += ".x" + std::to_string(numRepeats) + packedStr + ".b32 {";
+  opcode += ".x" + std::to_string(numRepeats);
+
+  if (redOp) {
+    if (unpacked) {
+      llvm_unreachable("Unpacked is unsupported with TMEM reduction");
+    }
+    // Add reduction modifier: .min or .max
+    switch (*redOp) {
+    case TMEMLoadReduceModifier::MIN:
+      opcode += ".min";
+      break;
+    case TMEMLoadReduceModifier::MAX:
+      opcode += ".max";
+      break;
+    default:
+      llvm_unreachable("Unsupported reduction modifier");
+    }
+    if (useAbs)
+      opcode += ".abs";
+    if (useNaN)
+      opcode += ".NaN";
+
+    std::string redStr;
+    if (elemTy.isF32()) {
+      redStr = ".f32";
+    } else {
+      llvm_unreachable("Unsupported type for TMEM reduction");
+    }
+    opcode += redStr;
+  } else {
+    opcode += packedStr + ".b32";
+  }
+
+  opcode += " {";
 
   SmallVector<PTXInstr::Operand *> operands;
   for (int i = 0; i < numRegPerMessage; i++) {
@@ -212,7 +250,19 @@ Value createTensorMemoryLoad(Location loc, MLIRContext *ctx, Value address,
     if (i < numRegPerMessage - 1)
       opcode += ", ";
   }
-  opcode += "}, [$" + std::to_string(numRegPerMessage) + " + " +
+  opcode += "}";
+
+  int nextOperandIdx = numRegPerMessage;
+
+  // Add redval output operand if reduction is enabled
+  if (redOp) {
+    opcode += ", {$" + std::to_string(nextOperandIdx) + "}";
+    auto *redvalOp = ptxBuilder.newOperand("=r");
+    operands.push_back(redvalOp);
+    nextOperandIdx++;
+  }
+
+  opcode += ", [$" + std::to_string(nextOperandIdx) + " + " +
             std::to_string(colOffset) + "]";
   if (secondHalfOffset)
     opcode += ", " + std::to_string(*secondHalfOffset);
@@ -221,16 +271,42 @@ Value createTensorMemoryLoad(Location loc, MLIRContext *ctx, Value address,
   auto &ld = *ptxBuilder.create(opcode);
   ld(operands, /*onlyAttachMLIRArgs=*/true);
 
-  // LLVM inline_asm with 1 result cannot return a struct.
+  // Build return type: data registers + optional redval register
+  int totalResults = numRegPerMessage + (redOp ? 1 : 0);
   Type retTy;
-  if (numRegPerMessage == 1) {
+  if (totalResults == 1) {
     retTy = i32_ty;
   } else {
-    SmallVector<Type> elemTypes(numRegPerMessage, i32_ty);
+    SmallVector<Type> elemTypes(totalResults, i32_ty);
     retTy = struct_ty(elemTypes);
   }
   Value ret = ptxBuilder.launch(rewriter, loc, retTy);
-  return ret;
+
+  // Extract load result and redval if needed
+  Value loadResult = ret;
+  Value redvalResult = nullptr;
+
+  if (redOp) {
+    // Per PTX spec: .num must be at least .x2 when .red is specified,
+    // so numRegPerMessage >= 2 * getElementsPerThread(atom) >= 2.
+    // ret is a struct with numRegPerMessage + 1 elements: {loadVals..., redval}
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<Type> loadElemTypes(numRegPerMessage, i32_ty);
+    Type loadStructTy = struct_ty(loadElemTypes);
+    Value loadStruct = b.undef(loadStructTy);
+    for (int i = 0; i < numRegPerMessage; i++) {
+      Value elem = b.extract_val(i32_ty, ret, i);
+      loadStruct = b.insert_val(loadStructTy, loadStruct, elem, i);
+    }
+    loadResult = loadStruct;
+    redvalResult = b.extract_val(i32_ty, ret, numRegPerMessage);
+    // Bitcast redval from i32 to the target element type
+    if (redvalResult && elemTy != i32_ty) {
+      redvalResult = b.bitcast(redvalResult, elemTy);
+    }
+  }
+
+  return {loadResult, redvalResult};
 }
 
 static SmallVector<Value> unpackResults(Value packedValues, Type elemTy,
@@ -266,19 +342,20 @@ static SmallVector<Value> unpackResults(Value packedValues, Type elemTy,
   return resultVals;
 }
 
-SmallVector<Value> lowerTMemLdSt(Location loc,
-                                 ConversionPatternRewriter &rewriter,
-                                 const LinearLayout &reps, ArrayRef<Value> vals,
-                                 TMemAccessAtom atom, Type llvmElemTy,
-                                 Value tmemBase, Value pred, int valsPerMessage,
-                                 bool unpacked,
-                                 std::optional<uint32_t> secondHalfOffset) {
+// Returns {resultVals, redvalVals} where redvalVals is empty if no reduction.
+// Reduction produces exactly one value per thread; if multiple messages
+// contribute partial reductions, they are combined into one.
+std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdSt(
+    Location loc, ConversionPatternRewriter &rewriter, const LinearLayout &reps,
+    ArrayRef<Value> vals, TMemAccessAtom atom, Type llvmElemTy, Value tmemBase,
+    Value pred, int valsPerMessage, bool unpacked,
+    std::optional<uint32_t> secondHalfOffset,
+    std::optional<TMEMLoadReduceModifier> redOp, bool useAbs, bool useNaN) {
   auto *ctx = rewriter.getContext();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto kReg = str_attr("register");
   auto kLane = str_attr("lane");
   auto kWarp = str_attr("warp");
-  auto kBlock = str_attr("block");
 
   auto kCol = str_attr("col");
   auto kRow = str_attr("row");
@@ -302,20 +379,18 @@ SmallVector<Value> lowerTMemLdSt(Location loc,
   // The block offset is already added to the tmemBase
   // Add warp groups to tmemBase
   if (reps.getInDimSize(kWarp) > 4) {
-    auto rowCol = applyLinearLayout(loc, rewriter, reps,
-                                    {{kReg, b.i32_val(0)},
-                                     {kLane, b.i32_val(0)},
-                                     {kWarp, warpId},
-                                     {kBlock, b.i32_val(0)}});
+    auto rowCol = applyLinearLayout(
+        loc, rewriter, reps,
+        {{kReg, b.i32_val(0)}, {kLane, b.i32_val(0)}, {kWarp, warpId}});
     auto [row, col] = getRowCol(rowCol);
     tmemBase = b.add(tmemBase,
                      b.or_(b.shl(row, b.i32_val(16)), col, /*disjoint*/ true));
   }
 
-  SmallVector<Value> resultVals;
+  SmallVector<Value> resultVals, redvalVals;
   for (int i = 0; i < reps.getInDimSize(kReg); i += valsPerMessage) {
     auto [row, col] =
-        getRowCol(reps.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}}));
+        getRowCol(reps.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}}));
     // Encode row into the base address and pass col as an immediate colOffset.
     int staticOffset = col | (row << 16);
     if (isStore) {
@@ -324,23 +399,29 @@ SmallVector<Value> lowerTMemLdSt(Location loc,
                               /*secondHalfOffset=*/secondHalfOffset, pred,
                               /*unpacked=*/unpacked, atom, rewriter);
     } else {
-      Value outVals = createTensorMemoryLoad(
-          loc, ctx, tmemBase, /*colOffset=*/staticOffset,
-          /*secondHalfOffset=*/secondHalfOffset,
-          /*unpacked=*/unpacked,
-          /*numRegPerMessage=*/valsPerMessage, atom, rewriter);
+      auto [outVals, redval] =
+          createTensorMemoryLoad(loc, ctx, tmemBase, /*colOffset=*/staticOffset,
+                                 /*secondHalfOffset=*/secondHalfOffset,
+                                 /*unpacked=*/unpacked,
+                                 /*numRegPerMessage=*/valsPerMessage, atom,
+                                 redOp, useAbs, useNaN, llvmElemTy, rewriter);
       resultVals.append(
           unpackResults(outVals, llvmElemTy, valsPerMessage, loc, rewriter));
+      if (redval)
+        redvalVals.push_back(redval);
     }
   }
 
-  return resultVals;
+  return {resultVals, redvalVals};
 }
 
-static SmallVector<Value>
+// Returns {resultVals, redvalVals} where redvalVals is empty if no reduction
+static std::pair<SmallVector<Value>, SmallVector<Value>>
 lowerTMemLdStFromInfo(Location loc, ConversionPatternRewriter &rewriter,
                       TMemLdStEncodingInfo &info, Value pred, Type llvmElemTy,
-                      ArrayRef<Value> vals, Value tmemBase) {
+                      ArrayRef<Value> vals, Value tmemBase,
+                      std::optional<TMEMLoadReduceModifier> redOp, bool useAbs,
+                      bool useNaN) {
   bool isStore = !vals.empty();
   if (info.broadcast) {
     auto removeBroadcast = std::move(info.broadcast.value());
@@ -350,12 +431,13 @@ lowerTMemLdStFromInfo(Location loc, ConversionPatternRewriter &rewriter,
     if (isStore) {
       inVals = removeBroadcast.apply(inVals);
     }
-    auto outVals = lowerTMemLdStFromInfo(loc, rewriter, info, pred, llvmElemTy,
-                                         inVals, tmemBase);
+    auto [outVals, redvalVals] =
+        lowerTMemLdStFromInfo(loc, rewriter, info, pred, llvmElemTy, inVals,
+                              tmemBase, redOp, useAbs, useNaN);
     if (!isStore) {
       outVals = broadcastAs(outVals, info.reps);
     }
-    return outVals;
+    return {outVals, redvalVals};
   }
   if (llvmElemTy.getIntOrFloatBitWidth() < 32) {
     unsigned bitwidth = llvmElemTy.getIntOrFloatBitWidth();
@@ -375,39 +457,71 @@ lowerTMemLdStFromInfo(Location loc, ConversionPatternRewriter &rewriter,
     if (isStore) {
       inVals = pack(inVals, packedElemTy, loc, rewriter, padding);
     }
-    auto outVals = lowerTMemLdStFromInfo(loc, rewriter, info, pred,
-                                         packedElemTy, inVals, tmemBase);
+    auto [outVals, redvalVals] =
+        lowerTMemLdStFromInfo(loc, rewriter, info, pred, packedElemTy, inVals,
+                              tmemBase, redOp, useAbs, useNaN);
     if (!isStore) {
       outVals = unpack(outVals, llvmElemTy, loc, rewriter, padding);
     }
-    return outVals;
+    return {outVals, redvalVals};
   }
 
   SmallVector<Value> inVals = to_vector(vals);
   if (isStore) {
     inVals = info.perm.apply(inVals);
   }
-  auto outVals = lowerTMemLdSt(
-      loc, rewriter, info.reps, inVals, info.atom, llvmElemTy, tmemBase, pred,
-      info.numRegsPerMessage, info.unpacked, info.secondHalfOffset);
+  auto [outVals, redvalVals] =
+      lowerTMemLdSt(loc, rewriter, info.reps, inVals, info.atom, llvmElemTy,
+                    tmemBase, pred, info.numRegsPerMessage, info.unpacked,
+                    info.secondHalfOffset, redOp, useAbs, useNaN);
   if (!isStore) {
     outVals = info.perm.inverse().apply(outVals);
   }
-  return outVals;
+  return {outVals, redvalVals};
 }
 
-static SmallVector<Value>
-lowerTMemLdStFromTypes(Location loc, ConversionPatternRewriter &rewriter,
-                       RankedTensorType regTy, MemDescType memTy,
-                       Value tmemBase, int maxnreg, Value pred, Type llvmElemTy,
-                       ArrayRef<Value> vals) {
+// Returns {resultVals, redvalVals} where redvalVals is empty if no reduction
+static std::pair<SmallVector<Value>, SmallVector<Value>> lowerTMemLdStFromTypes(
+    Location loc, ConversionPatternRewriter &rewriter, RankedTensorType regTy,
+    MemDescType memTy, Value tmemBase, int maxnreg, Value pred, Type llvmElemTy,
+    ArrayRef<Value> vals,
+    std::optional<TMEMLoadReduceModifier> redOp = std::nullopt,
+    bool useAbs = false, bool useNaN = false) {
   auto diag = [loc]() { return emitError(loc); };
   auto encodingInfoOr =
       computeTMemLdStEncodingInfo(regTy, memTy, maxnreg, diag);
   assert(succeeded(encodingInfoOr) &&
          "TMEM layout verification should catch invalid layouts");
   return lowerTMemLdStFromInfo(loc, rewriter, *encodingInfoOr, pred, llvmElemTy,
-                               vals, tmemBase);
+                               vals, tmemBase, redOp, useAbs, useNaN);
+}
+
+// Combine partial reductions into one value per thread via tree reduction.
+static void combinePartialReductions(Location loc,
+                                     ConversionPatternRewriter &rewriter,
+                                     SmallVector<Value> &redvalVals,
+                                     TMEMLoadReduceModifier redOp,
+                                     bool useNaN) {
+  if (redvalVals.size() <= 1)
+    return;
+  auto isMin = redOp == TMEMLoadReduceModifier::MIN;
+  auto applyMinMax = [&](Value lhs, Value rhs) {
+    return useNaN ? (isMin ? LLVM::MinimumOp::create(rewriter, loc, lhs, rhs)
+                           : LLVM::MaximumOp::create(rewriter, loc, lhs, rhs))
+                        ->getResult(0)
+                  : (isMin ? LLVM::MinNumOp::create(rewriter, loc, lhs, rhs)
+                           : LLVM::MaxNumOp::create(rewriter, loc, lhs, rhs))
+                        ->getResult(0);
+  };
+  // Use tree reduction: pair up elements at each level
+  while (redvalVals.size() > 1) {
+    SmallVector<Value> reduced;
+    assert(redvalVals.size() % 2 == 0 && "redvalVals must be a multiple of 2");
+    for (size_t i = 0; i < redvalVals.size(); i += 2) {
+      reduced.push_back(applyMinMax(redvalVals[i], redvalVals[i + 1]));
+    }
+    redvalVals = std::move(reduced);
+  }
 }
 
 struct TensorMemoryLoadOpConversion
@@ -425,18 +539,43 @@ struct TensorMemoryLoadOpConversion
     auto regTy = cast<RankedTensorType>(op.getType());
     auto memTy = cast<MemDescType>(op.getSrc().getType());
 
+    // Extract reduction attributes
+    auto redOp = op.getRedOp();
+    auto useAbs = op.getAbs().value_or(false);
+    auto useNaN = op.getNaN().value_or(false);
+    if (redOp) {
+      auto redTy = cast<RankedTensorType>(op.getRed().getType());
+      assert(getTotalElemsPerThread(redTy) == 1 &&
+             "reduction layout must produce exactly one value per thread");
+    }
+
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto maxnreg = getContextualMaxNReg(op);
-    auto resultVals =
-        lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase, maxnreg,
-                               b.i1_val(true), llvmElemTy, {});
+    auto [resultVals, redvalVals] = lowerTMemLdStFromTypes(
+        loc, rewriter, regTy, memTy, tmemBase, maxnreg, b.i1_val(true),
+        llvmElemTy, {}, redOp, useAbs, useNaN);
 
     Type structTy = getTypeConverter()->convertType(op.getType());
     Value resultStruct =
         packLLElements(loc, getTypeConverter(), resultVals, rewriter, structTy);
     // Wait insertion could be moved to the TTGIR level if needed.
     NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::LOAD);
-    rewriter.replaceOp(op, {resultStruct});
+
+    // tcgen05.ld.red is async, redval registers aren't valid until the wait
+    if (redOp)
+      combinePartialReductions(loc, rewriter, redvalVals, *redOp, useNaN);
+
+    // Handle reduction output if present
+    SmallVector<Value> results = {resultStruct};
+    if (redOp) {
+      // Pack redval values into the red tensor result
+      Type redStructTy = getTypeConverter()->convertType(op.getRed().getType());
+      Value redStruct = packLLElements(loc, getTypeConverter(), redvalVals,
+                                       rewriter, redStructTy);
+      results.push_back(redStruct);
+    }
+
+    rewriter.replaceOp(op, results);
     return success();
   }
 };
@@ -468,7 +607,9 @@ struct TensorMemoryStoreOpConversion
 
     // Emit a barrier to ensure all threads have finished writing to tensor
     // memory before any use of the tensor memory.
-    b.barrier();
+    // Can be AddrSpace::TensorWrite if we emit
+    // NVVM::Tcgen05WaitKind::STORE during barrier lowering
+    b.barrier(triton::gpu::AddrSpace::None);
 
     rewriter.eraseOp(op);
     return success();
@@ -512,7 +653,9 @@ struct TensorMemoryAllocOpConversion
       NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
       // Emit a barrier to ensure all threads have finished writing to tensor
       // memory before any use of the tensor memory.
-      b.barrier();
+      // Can be AddrSpace::TensorWrite if we emit
+      // NVVM::Tcgen05WaitKind::STORE during barrier lowering
+      b.barrier(triton::gpu::AddrSpace::None);
     }
     // Cast to address space 3 as the shared memory object uses 3.
     // TODO: clean this up and use either a int or ptr address space 6
@@ -567,6 +710,7 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
   auto kOffset = str_attr("offset");
   auto kRow = str_attr("row");
   auto kCol = str_attr("col");
+  auto kBlock = str_attr("block");
 
   MemDescType srcTy = op.getSrc().getType();
   MemDescType dstTy = op.getDst().getType();
@@ -588,9 +732,11 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
   // once we have access to the lbo/sbo
   const SmallVector<unsigned> instrShape = {32, atom.bCol / bitwidth};
   auto kWarp = str_attr("warp");
-  auto cvtWarp =
-      cvt.reshapeIns({{kRow, 32}, {kWarp, 4}, {kCol, cvt.getInDimSize(kCol)}})
-          .sublayout({kRow, kCol}, to_vector(cvt.getOutDimNames()));
+  auto cvtWarp = cvt.reshapeIns({{kRow, 32},
+                                 {kWarp, 4},
+                                 {kCol, cvt.getInDimSize(kCol)},
+                                 {kBlock, cvt.getInDimSize(kBlock)}})
+                     .sublayout({kRow, kCol}, to_vector(cvt.getOutDimNames()));
 
   auto loader = DotOpMmaSmemLoader::build(loc, rewriter, cvtWarp, bitwidth,
                                           smemBase, instrShape, 0, 5);
@@ -630,10 +776,16 @@ struct TensorMemoryCopyOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::TMEMCopyOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    assert(lookupNumCTAs(rewriter) == 1 && "NYI");
     Location loc = op->getLoc();
     Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
     bool twoCTAs = getModuleTwoCTAs(op);
+    // Similar to twoCTA tcgen05.mma, the 2CTA version of this op should only be
+    // emitted from the lead CTA.
+    if (twoCTAs) {
+      Value cluster0 = LLVM::NVIDIA::createLeadCTAPredicate(loc, rewriter);
+      pred = TritonLLVMOpBuilder(loc, rewriter).and_(pred, cluster0);
+    }
+
     if (failed(copySharedToTmem(rewriter, loc, typeConverter, op,
                                 adaptor.getSrc(), adaptor.getDst(), pred)))
       return failure();
@@ -713,46 +865,11 @@ struct TMEMSubSliceOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto srcTy = op.getSrc().getType();
-    auto dstTy = op.getResult().getType();
-    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
-
-    auto encoding = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
-        srcTy.getEncoding());
-    auto shapePerCTA = getShapePerCTA(srcTy);
-    int blockN = encoding.getBlockN();
-    int blockM = encoding.getBlockM();
-    int offsetCol = 0;
-    int offsetRow = 0;
-    assert(llvm::is_contained({64, 128}, blockM) && "checked by the verifier");
-    offsetCol = op.getN();
-
-    if (blockM == 64) {
-      // The layout interleaves blocks along the N dimension with the rows, such
-      // that the odd numbered blocks are in lanes [16, 32), below the previous
-      // even-numbered block.
-      int blockOffset = op.getN() / blockN;
-      if (blockOffset % 2) {
-        // Offset into rows [16, 32).
-        offsetRow = 16;
-        // Normalize column offset to the even block.
-        offsetCol -= blockN;
-      }
-      offsetCol -= blockN * (blockOffset / 2);
-    }
-
-    unsigned elementBitWidth = srcTy.getElementTypeBitWidth();
-    if (encoding.getColStride() * elementBitWidth != 32) {
-      // Adjust the column offset based on the element size.
-      int numElementsPer32B = 32 / (encoding.getColStride() * elementBitWidth);
-      if (offsetCol % numElementsPer32B != 0) {
-        return failure();
-      }
-      offsetCol /= numElementsPer32B;
-    }
+    auto dstTy = cast<MemDescType>(op.getResult().getType());
+    uint32_t offset = getTMemSubSliceOffset(dstTy, op.getN());
 
     Value tmemBase = adaptor.getSrc();
-    Value offsetVal = b.i32_val(offsetCol | offsetRow << 16);
+    Value offsetVal = b.i32_val(offset);
     Value newBase = b.add(b.ptrtoint(i32_ty, tmemBase), offsetVal);
     auto elemPtrTy = ptr_ty(rewriter.getContext(), 3);
     rewriter.replaceOp(op, b.inttoptr(elemPtrTy, newBase));
@@ -765,15 +882,14 @@ struct TMEMSubSliceOpConversion
 void mlir::triton::NVIDIA::populateTensorMemoryOpToLLVMPattern(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
-  patterns.add<TensorMemoryCopyOpConversion, TMEMSubSliceOpConversion,
-               TensorMemoryLoadOpConversion, TensorMemoryStoreOpConversion,
-               TensorMemoryAllocOpConversion>(typeConverter, benefit);
+  patterns.add<TensorMemoryCopyOpConversion, TensorMemoryLoadOpConversion,
+               TensorMemoryStoreOpConversion, TensorMemoryAllocOpConversion>(
+      typeConverter, benefit);
 }
 
 void mlir::triton::NVIDIA::populateTensorMemorySubviewOpToLLVMPattern(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
-  patterns.add<MemDescIndexOpConversion>(typeConverter, benefit);
-  patterns.add<MemDescReinterpretOpConversion>(typeConverter, benefit);
-  return;
+  patterns.add<MemDescReinterpretOpConversion, MemDescIndexOpConversion,
+               TMEMSubSliceOpConversion>(typeConverter, benefit);
 }

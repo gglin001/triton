@@ -42,10 +42,10 @@ public:
     // Treat all phases up to currentPhase - 1 as flushed, even if a phase has
     // no GPU activity records (i.e., nothing to flush from device to host).
     for (auto *data : this->getDataSet()) {
-      const auto currentPhase = data->getCurrentPhase();
-      if (currentPhase == 0)
+      const auto phaseInfo = data->getPhaseInfo();
+      if (phaseInfo.current == 0)
         continue;
-      data->updateFlushedPhase(currentPhase - 1);
+      data->completePhase(phaseInfo.current - 1);
     }
     return this;
   }
@@ -108,11 +108,9 @@ public:
   /// when modules and contexts are switched.
   /// So we just set them as thread local storage before the application kernel
   /// starts or after the application kernel ends.
-  void setMetricKernels(void *tensorMetricKernel, void *scalarMetricKernel,
-                        void *stream) override {
-    this->tensorMetricKernel = tensorMetricKernel;
-    this->scalarMetricKernel = scalarMetricKernel;
-    this->metricKernelStream = stream;
+  void setMetricKernels(
+      const MetricKernelLaunchState &metricKernelLaunchState) override {
+    this->metricKernelLaunchState = metricKernelLaunchState;
   }
 
 protected:
@@ -127,9 +125,7 @@ protected:
 
   mutable std::shared_mutex mutex;
   std::set<Data *> dataSet;
-  static thread_local void *tensorMetricKernel;
-  static thread_local void *scalarMetricKernel;
-  static thread_local void *metricKernelStream;
+  static thread_local MetricKernelLaunchState metricKernelLaunchState;
 
 private:
   bool started{};

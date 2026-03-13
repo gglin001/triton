@@ -10,8 +10,9 @@
 namespace mlir {
 
 AllocationSlice::AllocationSlice(Value value,
-                                 Interval<size_t> allocationInterval)
-    : allocationInterval(allocationInterval) {
+                                 Interval<size_t> allocationInterval,
+                                 Allocation::BufferId bufferId)
+    : allocationInterval(allocationInterval), bufferId(bufferId) {
   auto accessTy = cast<triton::gpu::MemDescType>(value.getType());
   this->accessTy = accessTy;
 
@@ -68,6 +69,9 @@ bool AllocationSlice::intersects(const AllocationSlice &other) const {
 void AllocationSlice::print(raw_ostream &os) const {
   os << "interval=[" << allocationInterval.start() << ","
      << allocationInterval.end() << ")";
+
+  if (bufferId != Allocation::InvalidBufferId)
+    os << " buffer=" << bufferId;
 
   os << " offsets=[";
   if (!subsliceOffsets.empty()) {
@@ -234,21 +238,35 @@ void MembarOrFenceAnalysis::visitTerminator(
 
 void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
   OpBuilder::InsertionGuard g(*builder);
-  auto barrierOp = triton::gpu::LocalBarrierOp::create(*builder, op->getLoc());
+  triton::gpu::BarrierOp::create(*builder, op->getLoc(),
+                                 triton::gpu::AddrSpace::Local);
 }
 
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncBlockInfoMapT *funcBlockInfoMap,
                             OpBuilder *builder) {
-  if (isa<gpu::BarrierOp, triton::gpu::LocalBarrierOp,
-          triton::gpu::WarpSpecializePartitionsOp>(op)) {
-    // If the current op is a barrier, we sync previous reads and writes
+  auto containsLocalBarrier = [](Operation *op) {
+    if (isa<gpu::BarrierOp>(op))
+      return true;
+    if (isa<triton::nvidia_gpu::ClusterBarrierOp>(op))
+      return true;
+    if (isa<triton::nvidia_gpu::ClusterWaitOp>(op))
+      return true;
+    if (isa<triton::gpu::WarpSpecializePartitionsOp>(op))
+      return true;
+    if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
+      return barrier.hasLocal();
+    return false;
+  };
+
+  if (containsLocalBarrier(op)) {
+    // If the current op is a local barrier, we sync previous reads and writes
     blockInfo->sync();
     return;
   }
 
   if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
-      !isa<gpu::BarrierOp, triton::gpu::LocalBarrierOp>(op->getNextNode())) {
+      !containsLocalBarrier(op->getNextNode())) {
     // If the current op is an async wait and the next op is not a barrier we
     // insert a barrier op and sync
     builder->setInsertionPointAfter(op);
@@ -263,8 +281,14 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     // Inter-function dependencies
     auto callOpInterface = dyn_cast<CallOpInterface>(op);
     if (auto callee =
-            dyn_cast<FunctionOpInterface>(callOpInterface.resolveCallable()))
-      curBlockInfo = funcBlockInfoMap->lookup(callee);
+            dyn_cast<FunctionOpInterface>(callOpInterface.resolveCallable())) {
+      auto calleeBlockInfo = funcBlockInfoMap->lookup(callee);
+      auto callBufferId = allocation->getBufferId(op);
+      size_t callOffset = 0;
+      if (callBufferId != Allocation::InvalidBufferId)
+        callOffset = allocation->getAllocatedInterval(callBufferId).start();
+      curBlockInfo = translateBlockInfoToCallsite(calleeBlockInfo, callOffset);
+    }
   } else {
     // Intra-function dependencies
     if (auto memoryEffectOpInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
@@ -274,10 +298,10 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
       memoryEffectOpInterface.getEffects(effectInstances);
       for (auto effectInstance : effectInstances) {
         if (auto value = effectInstance.getValue()) {
-          for (auto bufferId : allocation->getBufferIds(value)) {
+          for (auto bufferId : allocation->getAllBufferIdsWithAliases(value)) {
             if (bufferId != Allocation::InvalidBufferId) {
               auto interval = allocation->getAllocatedInterval(bufferId);
-              auto slice = AllocationSlice(value, interval);
+              auto slice = AllocationSlice(value, interval, bufferId);
 
               if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
                 curBlockInfo.syncWriteSlices[slice].insert(op);
@@ -314,7 +338,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
       auto dstTy = cast<RankedTensorType>(cvt.getType());
       auto srcLayout = triton::gpu::toLinearLayout(srcTy);
       auto dstLayout = triton::gpu::toLinearLayout(dstTy);
-      isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
+      auto kWarp = StringAttr::get(op->getContext(), "warp");
+      isWarpSync = mlir::isCvtDimSync(srcLayout, dstLayout, kWarp);
     }
 
     if (!curBlockInfo.syncReadSlices.empty() ||
@@ -326,7 +351,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     auto interval = allocation->getAllocatedInterval(scratchBufferId);
     auto scratchSlice = AllocationSlice(interval);
     curBlockInfo.syncWriteSlices[scratchSlice].insert(op);
-    auto insertCTABarrier = blockInfo->isIntersected(curBlockInfo, filter);
+    auto insertCTABarrier =
+        blockInfo->isIntersected(curBlockInfo, filter, allocation);
     if (insertCTABarrier) {
       builder->setInsertionPoint(op);
       insertBarrier(op, builder);
@@ -336,7 +362,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     if (insertCTABarrier || !isWarpSync)
       blockInfo->sync();
     curBlockInfo.syncReadSlices[scratchSlice].insert(op);
-  } else if (blockInfo->isIntersected(curBlockInfo, filter)) {
+  } else if (blockInfo->isIntersected(curBlockInfo, filter, allocation)) {
     builder->setInsertionPoint(op);
     insertBarrier(op, builder);
     blockInfo->sync();

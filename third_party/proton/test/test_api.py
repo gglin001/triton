@@ -308,6 +308,21 @@ def test_scope_exclusive(tmp_path: pathlib.Path):
     assert test1_metrics["b"] == 1
 
 
+def test_scope_vector_metrics(tmp_path: pathlib.Path):
+    temp_file = tmp_path / "test_scope_vector_metrics.hatchet"
+    proton.start(str(temp_file.with_suffix("")))
+    proton.enter_scope("test0", metrics={"veci": [1, 2, 3], "vecd": [1.0, 2.0, 3.0]})
+    proton.exit_scope()
+    proton.finalize()
+    assert temp_file.exists()
+    with temp_file.open() as f:
+        data = json.load(f)
+    for child in data[0]["children"]:
+        if child["frame"]["name"] == "test0":
+            assert child["metrics"]["veci"] == [1, 2, 3]
+            assert child["metrics"]["vecd"] == [1.0, 2.0, 3.0]
+
+
 def test_state(tmp_path: pathlib.Path):
     temp_file = tmp_path / "test_state.hatchet"
     proton.start(str(temp_file.with_suffix("")))
@@ -412,12 +427,12 @@ def test_data_api(tmp_path: pathlib.Path):
     assert json_data is not None
     msgpack_data = proton.data.get_msgpack(session_id)
     assert isinstance(msgpack_data, bytes)
-    is_flushed = proton.data.is_phase_flushed(session_id, 0)
-    assert is_flushed is False
+    is_complete = proton.data.is_phase_complete(session_id, 0)
+    assert is_complete is False
     next_phase = proton.data.advance_phase(session_id)
     assert next_phase == 1
-    is_flushed = proton.data.is_phase_flushed(session_id, 1)
-    assert is_flushed is False
+    is_complete = proton.data.is_phase_complete(session_id, 1)
+    assert is_complete is False
 
     # Even if a phase has no GPU activity records, flushing should still mark it
     # as flushed.
@@ -425,7 +440,11 @@ def test_data_api(tmp_path: pathlib.Path):
     next_phase = proton.data.advance_phase(session_id)
     assert next_phase == 2
     proton.deactivate(session_id, flushing=True)
-    assert proton.data.is_phase_flushed(session_id, 1) is True
-    assert proton.data.is_phase_flushed(session_id, 2) is False
+    assert proton.data.is_phase_complete(session_id, 1) is True
+    assert proton.data.is_phase_complete(session_id, 2) is False
+
+    # Test clear and clear_up_to_phase
+    proton.data.clear(session_id, phase=0)
+    proton.data.clear(session_id, phase=2, clear_up_to_phase=True)
 
     proton.finalize()

@@ -5,6 +5,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/bit.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -145,15 +146,13 @@ private:
   }
 
   void visitNonControlFlowArguments(
-      Operation *op, const RegionSuccessor &successor,
-      ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices,
-      unsigned firstIndex) override {
+      Operation *op, const RegionSuccessor & /*successor*/,
+      ValueRange /*nonSuccessorInputs*/,
+      ArrayRef<dataflow::Lattice<AxisInfo> *> argLattices) override {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       visitForOpInductionVar(forOp, argLattices);
     } else {
-      setAllToEntryStates(argLattices.take_front(firstIndex));
-      setAllToEntryStates(argLattices.drop_front(
-          firstIndex + successor.getSuccessorInputs().size()));
+      setAllToEntryStates(argLattices);
     }
   }
 
@@ -284,20 +283,42 @@ public:
 private:
   int64_t getContiguity(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                         int dim) override {
-    // Contiguity assumes an increasing sequence. So for SubIOp contiguous
-    // RHS doesn't produce a contiguous result.
-    if (isa<arith::SubIOp>(op))
+    if (isa<arith::SubIOp>(op)) {
+      // Case 1: If contiguity(lhs) > 1 and contiguity(rhs) > 1,
+      // x_t - y_t = (base_x + t) - (base_y + t) = base_x - base_y for any
+      // 0 <= t < min(contig_x, contig_y), so contiguity is 1.
+      // Case 2: If contiguity(lhs) > 1 and contiguity(rhs) == 1,
+      // x_t - y = (base_x + t) - base_y = base_x - base_y + t for any
+      // 0 <= t < contig_x,
+      // the contiguity depends on the constancy of rhs.
+      // Case 3: If contiguity(lhs) == 1 and contiguity(rhs) > 1,
+      // x - y_t = base_x - (base_y + t) = base_x - base_y - t for any
+      // 0 <= t < contig_y. The result is decreasing within the contiguous
+      // block, so contiguity is 1.
+      // Case 4: If contiguity(lhs) == 1 and contiguity(rhs) == 1,
+      // x - y = base_x - base_y, so contiguity is 1.
       return gcd(lhs.getContiguity(dim), rhs.getConstancy(dim));
-
+    }
+    // For AddIOp and AddPtrOp
+    // Case 1: If contiguity(lhs) > 1 and contiguity(rhs) > 1,
+    // x_t + y_t = (base_x + t) + (base_y + t) = base_x + base_y + 2t for any
+    // 0 <= t < min(contig_x, contig_y),
+    // so contiguity is 1.
+    // Case 2: If contiguity(lhs) > 1 and contiguity(rhs) == 1,
+    // x_t + y = (base_x + t) + base_y = base_x + base_y + t for any
+    // 0 <= t < contig_x, so contiguity depends on constancy of rhs.
+    // Case 3: If contiguity(lhs) == 1 and contiguity(rhs) > 1,
+    // It's symmetric to case B.
+    // Case 4: If contiguity(lhs) == 1 and contiguity(rhs) == 1,
+    // It's trivial that contiguity is 1
     return std::max(gcd(lhs.getConstancy(dim), rhs.getContiguity(dim)),
                     gcd(lhs.getContiguity(dim), rhs.getConstancy(dim)));
   }
 
   int64_t getDivisibility(OpTy op, const AxisInfo &lhs, const AxisInfo &rhs,
                           int dim) override {
-    // lhs = k * d_lhs = k * k' * gcd(d_lhs, d_rhs)
-    // rhs = p * d_rhs = p * p' * gcd(d_lhs, d_rhs)
-    // lhs + rhs = k * d_lhs + p * d_rhs = (k * k' + p * p') * gcd(d_lhs, d_rhs)
+    int64_t elemSize = 1;
+    auto lhsDivisibility = lhs.getDivisibility(dim);
     auto rhsDivisibility = rhs.getDivisibility(dim);
     if constexpr (std::is_same_v<OpTy, triton::AddPtrOp>) {
       //  %ptr = addptr %lhs, %rhs
@@ -312,11 +333,44 @@ private:
       // with element locations:
       // [4, 5, 6, 7]
       // It is "strided contiguous" with a divisibility of 16 bytes
-      auto elemSize = std::max<int64_t>(
+      elemSize = std::max<int64_t>(
           1, triton::getPointeeBitWidth(op.getPtr().getType()) / 8);
       rhsDivisibility = multiplyDivisor(rhs.getDivisibility(dim), elemSize);
     }
-    return gcd(lhs.getDivisibility(dim), rhsDivisibility);
+    if (lhs.getContiguity(dim) > 1 && rhs.getContiguity(dim) > 1) {
+      // If both operands are contiguous, the in-group offsets are:
+      // Let lhs_t = base_lhs + t and rhs_t = base_rhs + t for any
+      // 0 <= t < min(contig_lhs, contig_rhs).
+      // For addition:
+      //   lhs_t + rhs_t = base_lhs + base_rhs + 2t
+      // For subtraction:
+      //   lhs_t - rhs_t = base_lhs - base_rhs
+      if constexpr (std::is_same_v<OpTy, arith::SubIOp>) {
+        if (lhs.getContiguity(dim) == rhs.getContiguity(dim))
+          return gcd(lhsDivisibility, rhsDivisibility);
+      }
+      if ((lhsDivisibility % 2 == 0 && rhsDivisibility % 2 == 0)) {
+        // Both even -> result divisible by 2.
+        return 2;
+      } else {
+        // At least one is odd -> the "lower bound" of divisibility is 1.
+        return 1;
+      }
+    } else {
+      // At least one operand is partially constant.
+      // Divisibility is defined on the *first element* of a contiguity
+      // group. When an operand has contiguity larger than the result
+      // contiguity, the "first element of a result group" can fall inside an
+      // operand's contiguity group, so we must clamp the operand divisibility
+      // accordingly (otherwise we can overestimate alignment).
+      if (lhs.getContiguity(dim) > 1 || rhs.getContiguity(dim) > 1) {
+        auto resContiguity = getContiguity(op, lhs, rhs, dim);
+        return gcd(lhsDivisibility, rhsDivisibility,
+                   multiplyDivisor(resContiguity, elemSize));
+      } else {
+        return gcd(lhsDivisibility, rhsDivisibility);
+      }
+    }
   }
 
   std::optional<int64_t> getConstantValue(OpTy op, const AxisInfo &lhs,
@@ -364,7 +418,11 @@ private:
                           const AxisInfo &rhs, int dim) override {
     auto lhsDivisibility = lhs.getDivisibility(dim);
     if (lhs.getContiguity(dim) > 1 && rhs.getConstantValue() != 1) {
-      // Treat [2^n,2^n+1,...]'s divisibility as 1 instead of 2^n
+      // If the operand is contiguous, the divisibility of the
+      // sequence drops to 1.
+      // Example: [4, 5, 6, 7] (base 4 divisible by 4).
+      // Multiplying by 2 yields [8, 10, 12, 14] (GCD=2).
+      // Preserving divisibility=4 implies result align 8 (unsafe).
       lhsDivisibility = 1;
     }
     auto rhsDivisibility = rhs.getDivisibility(dim);
@@ -645,6 +703,125 @@ public:
     }
     return AxisInfo(contiguity, divisibility, constancy,
                     operands[0]->getValue().getConstantValue());
+  }
+};
+
+class ReshapeOpAxisInfoVisitor final
+    : public AxisInfoVisitorImpl<triton::ReshapeOp> {
+public:
+  using AxisInfoVisitorImpl<triton::ReshapeOp>::AxisInfoVisitorImpl;
+
+  AxisInfo
+  getAxisInfo(triton::ReshapeOp op,
+              ArrayRef<const dataflow::Lattice<AxisInfo> *> operands) override {
+    AxisInfo srcInfo = operands[0]->getValue();
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto dstTy = cast<RankedTensorType>(op.getType());
+    auto dstShape = dstTy.getShape();
+
+    // Constant tensor stays constant
+    if (srcInfo.getConstantValue().has_value()) {
+      AxisInfo::DimVectorT contiguity(dstTy.getRank(), 1);
+      AxisInfo::DimVectorT divisibility(
+          dstTy.getRank(),
+          highestPowOf2Divisor(srcInfo.getConstantValue().value()));
+      AxisInfo::DimVectorT constancy(dstShape.begin(), dstShape.end());
+      return AxisInfo(contiguity, divisibility, constancy,
+                      srcInfo.getConstantValue());
+    }
+
+    auto srcShape = srcTy.getShape();
+    // `suffixProducts[d + 1]` is the flat stride of axis `d` in row-major
+    // order.
+    auto getSuffixProducts = [](ArrayRef<int64_t> shape) {
+      SmallVector<int64_t> suffixProducts(shape.size() + 1, 1);
+      for (int d = shape.size() - 1; d >= 0; --d)
+        suffixProducts[d] = suffixProducts[d + 1] * shape[d];
+      return suffixProducts;
+    };
+    auto srcSuffixProducts = getSuffixProducts(srcShape);
+    auto dstSuffixProducts = getSuffixProducts(dstShape);
+
+    AxisInfo::DimVectorT contiguity(dstTy.getRank(), 1);
+    AxisInfo::DimVectorT divisibility(dstTy.getRank(), 1);
+    AxisInfo::DimVectorT constancy(dstTy.getRank(), 1);
+
+    for (int dstDim = 0; dstDim < dstTy.getRank(); ++dstDim) {
+      int64_t dstStride = dstSuffixProducts[dstDim + 1];
+      // Main idea:
+      // Let m = dstDim, and Q = dstSuffixProducts, P = srcSuffixProducts
+      // Q[m + 1] \in [P[i + 1], P[i]).
+      // This means that dimension m is splitting dimension i, so it often
+      // inherits the properties of this dimension
+      // Note that the "off by one" indexing comes from the fact that the
+      // stride for dimension m is in Q[m + 1].
+      int srcDim = 0;
+      for (; srcDim < srcTy.getRank(); ++srcDim) {
+        int64_t srcStride = srcSuffixProducts[srcDim + 1];
+        if (srcStride <= dstStride && dstStride < srcSuffixProducts[srcDim])
+          break;
+      }
+
+      if (srcDim == srcTy.getRank()) {
+        // If there are 1-sized axes at the beginning, we do not have
+        // dstStride < srcSuffixProducts[srcDim] but we can still reuse
+        // the outermost source axis.
+        assert(dstShape[dstDim] == 1);
+        srcDim = 0;
+      }
+
+      int64_t srcStride = srcSuffixProducts[srcDim + 1];
+      int64_t srcContiguity = srcInfo.getContiguity(srcDim);
+      int64_t srcDivisibility = srcInfo.getDivisibility(srcDim);
+      int64_t srcConstancy = srcInfo.getConstancy(srcDim);
+
+      if (srcContiguity > 1) {
+        // Contiguity only survives when reshape lands on the low boundary of
+        // the source axis. Starting inside the axis loses the unit-stride run.
+        if (dstStride == srcStride) {
+          int64_t dstContiguity = std::min(srcContiguity, dstShape[dstDim]);
+          contiguity[dstDim] = dstContiguity;
+          // If the whole contiguous run survives, the group bases are
+          // unchanged. When the run is truncated, later group bases can start
+          // inside the original run, so divisibility must be clamped
+          // accordingly.
+          divisibility[dstDim] = dstContiguity == srcContiguity
+                                     ? srcDivisibility
+                                     : std::min(srcDivisibility, dstContiguity);
+        }
+        continue;
+      }
+
+      int64_t constancyEnd = srcStride * srcConstancy;
+      if (dstStride <= constancyEnd) {
+        // If we land inside a constant axis, the constancy is the minimum
+        // between the shape and how much constancy survives.
+        int64_t dstConstancy =
+            std::min<int64_t>(dstShape[dstDim], constancyEnd / dstStride);
+
+        // Several constant dimensions can merge into a single constant
+        // dimension
+        int64_t remainingSize = dstShape[dstDim] / dstConstancy;
+        for (int dim = srcDim - 1;
+             srcConstancy == srcShape[srcDim] && dim >= 0 && remainingSize > 1;
+             --dim) {
+          int64_t pieceSize = std::min(srcShape[dim], remainingSize);
+          int64_t pieceConstancy =
+              std::min(srcInfo.getConstancy(dim), pieceSize);
+          dstConstancy *= pieceConstancy;
+          if (pieceConstancy < pieceSize)
+            break;
+          remainingSize /= pieceSize;
+        }
+        constancy[dstDim] = dstConstancy;
+      }
+      // Divisibility stays the same when the constant block is split
+      // even for constancy == 1.
+      divisibility[dstDim] = srcDivisibility;
+    }
+
+    return AxisInfo(contiguity, divisibility, constancy,
+                    srcInfo.getConstantValue());
   }
 };
 
@@ -1048,6 +1225,7 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver,
   visitors.append<BroadcastOpAxisInfoVisitor>();
   visitors.append<SplatOpAxisInfoVisitor>();
   visitors.append<ExpandDimsOpAxisInfoVisitor>();
+  visitors.append<ReshapeOpAxisInfoVisitor>();
   visitors.append<CmpOpAxisInfoVisitor<arith::CmpIOp>>();
   visitors.append<LogicalOpAxisInfoVisitor<arith::AndIOp>,
                   LogicalOpAxisInfoVisitor<arith::OrIOp>,

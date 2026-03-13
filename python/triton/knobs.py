@@ -470,6 +470,9 @@ class runtime_knobs(base_knobs):
     kernel_load_start_hook: HookChain[InitHandleHook] = HookChain()
     kernel_load_end_hook: HookChain[InitHandleHook] = HookChain(reversed=True)
 
+    # hook to unload module when kernel is freed
+    kernel_unload_hook: HookChain[InitHandleHook] = HookChain()
+
     # Hook for inspecting compiled functions and modules
     jit_cache_hook: Optional[JITHook] = None
     # Hook to signal that a kernel is done compiling and inspect compiled function.
@@ -517,14 +520,42 @@ class amd_knobs(base_knobs):
 
     scalarize_packed_fops: env_bool = env_bool("AMDGCN_SCALARIZE_PACKED_FOPS")
 
+    # Path to dump MIR files for debugging/analysis
+    dump_mir: env_opt_str = env_opt_str("TRITON_DUMP_MIR")
+    # Path to externally-provided MIR files to use instead of generated ones
+    swap_mir: env_opt_str = env_opt_str("TRITON_SWAP_MIR")
+    # Enable machine instruction scheduler in MIR swap mode
+    swap_mir_enable_misched: env_bool = env_bool("TRITON_SWAP_MIR_ENABLE_MISCHED", False)
+
 
 class proton_knobs(base_knobs):
     disable: env_bool = env_bool("TRITON_PROTON_DISABLE", False)
     cupti_lib_dir: env_str = env_str(
         "TRITON_CUPTI_LIB_PATH",
         str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti"))
+    cupti_lib_blackwell_dir: env_str = env_str(
+        "TRITON_CUPTI_LIB_BLACKWELL_PATH",
+        str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti-blackwell"))
     profile_buffer_size: env_int = env_int("TRITON_PROFILE_BUFFER_SIZE", 64 * 1024 * 1024)
     enable_nvtx: env_bool = env_bool("TRITON_ENABLE_NVTX", True)
+    # This knob is effective only on Blackwell+ GPUs.
+    #
+    # When enabled, the profiling session must start after CUDA driver
+    # initialization but before the CUDA context is created.
+    #
+    # You can ensure this in one of the following ways:
+    #
+    # 1) Use the `proton` CLI tool to launch the Python script, e.g.:
+    #    `TRITON_ENABLE_HW_TRACE=1 proton python my_script.py`
+    #
+    # 2) Call `proton.start()` immediately after importing Proton, e.g.:
+    #    ```python
+    #    import triton
+    #    import triton.profiler as proton
+    #    triton.knobs.proton.enable_hw_trace = True
+    #    proton.start(hook="triton")
+    #    ```
+    enable_hw_trace: env_bool = env_bool("TRITON_ENABLE_HW_TRACE", False)
 
 
 build = build_knobs()

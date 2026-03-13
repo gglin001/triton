@@ -33,7 +33,7 @@ public:
 
   size_t getContextDepth();
 
-  Profiler *getProfiler() { return profiler; }
+  Profiler *getProfiler() const { return profiler; }
 
 private:
   Session(size_t id, const std::string &path, Profiler *profiler,
@@ -97,11 +97,11 @@ public:
 
   std::string getData(size_t sessionId, size_t phase);
 
-  void clearData(size_t sessionId, size_t phase);
+  void clearData(size_t sessionId, size_t phase, bool clearUpToPhase = false);
 
   size_t advanceDataPhase(size_t sessionId);
 
-  bool isDataPhaseFlushed(size_t sessionId, size_t phase);
+  bool isDataPhaseComplete(size_t sessionId, size_t phase);
 
   void enterScope(const Scope &scope);
 
@@ -116,6 +116,7 @@ public:
       const std::vector<std::pair<size_t, std::string>> &scopeIdNames,
       const std::vector<std::pair<size_t, size_t>> &scopeIdParents,
       const std::string &metadataPath);
+  void destroyFunctionMetadata(uint64_t functionId);
 
   void enterInstrumentedOp(uint64_t streamId, uint64_t functionId,
                            uint8_t *buffer, size_t size);
@@ -127,8 +128,7 @@ public:
                   const std::map<std::string, MetricValueType> &scalarMetrics,
                   const std::map<std::string, TensorMetric> &tensorMetrics);
 
-  void setMetricKernels(void *tensorMetricKernel, void *scalarMetricKernel,
-                        void *stream);
+  void setMetricKernels(const MetricKernelLaunchState &metricKernelLaunchState);
 
   void setState(std::optional<Context> context);
 
@@ -141,6 +141,8 @@ private:
                                        const std::string &contextSourceName,
                                        const std::string &dataName,
                                        const std::string &mode);
+
+  Session *getSessionOrThrow(size_t sessionId);
 
   void activateSessionImpl(size_t sessionId);
 

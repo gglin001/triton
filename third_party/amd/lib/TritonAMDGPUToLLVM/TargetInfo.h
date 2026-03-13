@@ -22,7 +22,11 @@ public:
 
   int getSharedMemorySize() const;
 
+  size_t getSharedMemoryPartitionSize() const override;
+
   bool supportMaximumMinimum() const override;
+
+  bool supportDppBroadcast() const;
 
   Value getClusterCTAId(RewriterBase &rewriter, Location loc) const override;
 
@@ -30,7 +34,10 @@ public:
                Value cmp) const override;
 
   void barrier(Location loc, RewriterBase &rewriter,
-               bool isWarpSync = false) const override;
+               triton::gpu::AddrSpace targets) const override;
+  void clusterBarrier(Location loc, RewriterBase &rewriter) const override;
+
+  void warpSync(Location loc, RewriterBase &rewriter) const override;
 
   void storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                     std::optional<Value> ctaId, Value val,
@@ -47,6 +54,8 @@ public:
     unsigned instBitWidth;
     // Number of elements that the instruction needs to be contiguous in LDS
     unsigned tileSize;
+    // Whether B8 types require double contiguity (for certain architectures)
+    bool needsDoubleB8Contiguity;
   };
   // Get the ds_read_tr parameters for the instruction that operates on the
   // element granularty specified by bitWidth
@@ -68,8 +77,8 @@ public:
                   ProgramIDDim axis) const override;
 
   bool warpReduce(RewriterBase &rewriter, Location loc, SmallVector<Value> &acc,
-                  triton::ReduceOp op, unsigned numLaneToReduce,
-                  unsigned interleave) const override;
+                  triton::ReduceOp op,
+                  unsigned reduceLaneIdMask) const override;
 
   std::string getMulhiFuncName(Type resultElementTy) const override;
 
@@ -89,6 +98,9 @@ public:
 
   bool supportVectorizedAtomics() const override;
 
+  bool supportBitwidth16Elementwise() const override;
+  bool supportBitwidth32Elementwise() const override;
+
   // Returns true if the target supports per lane addresses into LDS for
   // direct-to-lds loads. Some architectures (e.g. GFX9) do not support
   // scattering and instead have to write warp coalesced into LDS
@@ -101,9 +113,15 @@ public:
   bool requiresAliasInfoForAsyncOps() const;
   bool supportsDirectToLdsLoadBitWidth(int bitWidth) const;
   bool supportsDirectFromLdsStoreBitWidth(int bitWidth) const;
+  bool supportsBufferLoadToLocal() const;
 
   bool supportsMultiCTALaunch() const;
+  bool supportsTDM() const;
   bool supportsClusterLoadBitWidth(int biwWidth) const;
+
+  bool supportsWaveId() const;
+  bool supportsPermlaneSwap() const;
+  bool supportsCvtPkScalePk8() const;
 
   void localLoadOpAnnotation(triton::gpu::LocalLoadOp localLoadOp,
                              Operation *llLoadOp) const override;

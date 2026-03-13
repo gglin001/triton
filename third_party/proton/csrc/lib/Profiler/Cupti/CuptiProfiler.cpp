@@ -6,6 +6,7 @@
 #include "Driver/GPU/CuptiApi.h"
 #include "Driver/GPU/NvtxApi.h"
 #include "Profiler/Cupti/CuptiPCSampling.h"
+#include "Profiler/Graph.h"
 #include "Runtime/CudaRuntime.h"
 #include "Utility/Env.h"
 #include "Utility/Map.h"
@@ -62,6 +63,7 @@ uint32_t processActivityKernel(
   if (!/*not valid*/ corrIdToExternId.withRead(
           correlationId, [&externId](size_t value) { externId = value; })) {
     corrIdToExternId.erase(correlationId);
+    return correlationId;
   }
   if (kernel->graphId == 0) { // XXX: This is a misnomer confirmed by NVIDIA,
                               // actually it refers to graphExecId
@@ -118,26 +120,39 @@ uint32_t processActivityKernel(
     // We have a graph creation captured
     auto &graphNodeIdToState = externState.graphNodeIdToState;
     auto *nodeState = graphNodeIdToState.find(kernel->graphNodeId);
-    if (nodeState && !nodeState->isMetricNode) {
-      const bool isMissingName = nodeState->isMissingName;
+    if (nodeState && !nodeState->isMetricNode()) {
+      const bool isMissingName = nodeState->isMissingName();
       if (!isMissingName) {
         nodeState->forEachEntry(
             [activity, &dataPhases](Data *data, DataEntry &entry) {
               if (auto kernelMetric = convertKernelActivityToMetric(activity)) {
-                entry.upsertMetric(std::move(kernelMetric));
+                entry.upsertLinkedMetric(std::move(kernelMetric), entry.id);
                 detail::updateDataPhases(dataPhases, data, entry.phase);
               }
             });
       } else {
-        nodeState->forEachEntry(
-            [kernel, activity, &dataPhases](Data *data, DataEntry &entry) {
-              if (auto kernelMetric = convertKernelActivityToMetric(activity)) {
-                auto childEntry =
-                    data->addOp(entry.phase, entry.id, {Context(kernel->name)});
-                childEntry.upsertMetric(std::move(kernelMetric));
-                detail::updateDataPhases(dataPhases, data, entry.phase);
-              }
-            });
+        nodeState->forEachEntry([kernel, activity,
+                                 &dataPhases](Data *data, DataEntry &entry) {
+          if (auto kernelMetric = convertKernelActivityToMetric(activity)) {
+            auto childEntry = data->addOp(Data::kVirtualPhase, entry.id,
+                                          {Context(kernel->name)});
+            entry.upsertLinkedMetric(std::move(kernelMetric), childEntry.id);
+            detail::updateDataPhases(dataPhases, data, entry.phase);
+          }
+        });
+      }
+    } else if (!nodeState) {
+      // This can happen when graph creation is not captured, or the node is
+      // skipped during capture. In both cases we don't have per-node info, so
+      // we just attach the kernel metric to the graph launch entry without
+      // creating a child entry for the node.
+      for (auto &[data, entry] : externState.dataToEntry) {
+        if (auto kernelMetric = convertKernelActivityToMetric(activity)) {
+          auto childEntry =
+              data->addOp(entry.phase, entry.id, {Context(kernel->name)});
+          childEntry.upsertMetric(std::move(kernelMetric));
+          detail::updateDataPhases(dataPhases, data, childEntry.phase);
+        }
       }
     }
     // Decrease the expected kernel count
@@ -173,6 +188,64 @@ uint32_t processActivity(
     break;
   }
   return correlationId;
+}
+
+void buildGraphNodeEntries(
+    const DataToEntryMap &dataToEntry, const GraphState &graphState,
+    CuptiProfiler::ExternIdState::GraphNodeStateTable &graphNodeIdToState) {
+  for (const auto &[data, launchEntry] : dataToEntry) {
+    auto nodeStateIt = graphState.dataToEntryIdToNodeStates.find(data);
+    if (nodeStateIt == graphState.dataToEntryIdToNodeStates.end())
+      // This is a new data which was not enabled during graph capture
+      continue;
+    auto baseEntry = data->addOp(launchEntry.phase, launchEntry.id,
+                                 {Context{GraphState::captureTag}});
+    for (const auto &[targetEntryId, nodeStates] : nodeStateIt->second) {
+      for (const auto *nodeState : nodeStates) {
+        auto &graphNodeState = graphNodeIdToState.emplace(nodeState->nodeId);
+        graphNodeState.status = nodeState->status;
+        graphNodeState.setEntry(data, DataEntry(targetEntryId, baseEntry.phase,
+                                                baseEntry.metricSet.get()));
+      }
+    }
+  }
+}
+
+void queueGraphMetrics(
+    const DataToEntryMap &dataToEntry, PendingGraphPool *pendingGraphPool,
+    const CUpti_CallbackData *callbackData, const GraphState &graphState,
+    CuptiProfiler::ExternIdState::GraphNodeStateTable &graphNodeIdToState) {
+  if (graphState.metricNodeIdToNumWords.empty()) {
+    return;
+  }
+  std::map<Data *, std::vector<DataEntry>> metricNodeEntries;
+  size_t phase = Data::kNoCompletePhase;
+  for (const auto [data, launchEntry] : dataToEntry) {
+    phase = launchEntry.phase;
+    for (const auto &metricNode : graphState.metricNodeIdToNumWords) {
+      auto nodeId = metricNode.first;
+      auto *nodeState = graphNodeIdToState.find(nodeId);
+      if (!nodeState) // The node has been skipped during graph capture
+        continue;
+      if (nodeState->dataToEntry.count(data)) {
+        metricNodeEntries[data].emplace_back(nodeState->dataToEntry.at(data));
+      } else {
+        // Indicate that we'll call upsertFlexibleMetric instead of
+        // upsertLinkedFlexibleMetric in queueGraphMetrics, so that the kernel
+        // metric can be attached to the graph launch entry when node entry is
+        // not found.
+        metricNodeEntries[data].emplace_back(
+            DataEntry(Scope::DummyScopeId, phase, launchEntry.metricSet.get()));
+      }
+    }
+  }
+
+  const auto numMetricNodes = graphState.metricNodeIdToNumWords.size();
+  const auto numMetricWords = graphState.numMetricWords;
+  if (callbackData->context != nullptr)
+    pendingGraphPool->flushIfNeeded(numMetricWords);
+  pendingGraphPool->push(phase, metricNodeEntries, numMetricNodes,
+                         numMetricWords);
 }
 
 constexpr std::array<CUpti_CallbackId, 11> kGraphCallbacks = {
@@ -280,122 +353,18 @@ bool isLaunch(CUpti_CallbackId cbId) {
 
 #undef PROTON_KERNEL_CALLBACK_LIST
 
-// TODO: Move it to GPUProfiler.h once AMD side is settled
-struct GraphState {
-  using Callpath = std::vector<Context>;
-
-  struct NodeState {
-    // Mapping from Data object to captured callpath.
-    std::map<Data *, Callpath> captureContexts;
-    // A unique id for the graph node
-    uint64_t nodeId{};
-    // Whether the node is missing name
-    bool isMissingName{};
-    // Whether the node is a metric kernel node
-    bool isMetricNode{};
-  };
-
-  // Capture tag to identify captured call paths
-  static constexpr const char *captureTag = "<captured_at>";
-  using NodeStateRef = std::reference_wrapper<NodeState>;
-  // Cached per-Data callpath groups: Data -> (callpath -> [nodeStates...])
-  std::map<Data *, std::map<Callpath, std::vector<NodeStateRef>>>
-      dataToCallpathToNodeStates;
-  // Mapping from node id to node state, has to be ordered based on node id
-  // which is the order of node creation
-  std::map<uint64_t, NodeState> nodeIdToState;
-  // Identify whether a node is a metric kernel node.
-  // NOTE: This set has to be ordered to match the node creation order.
-  std::set<uint64_t> metricKernelNodeIds;
-  // If the graph is launched after profiling started,
-  // we need to throw an error and this error is only thrown once
-  bool captureStatusChecked{};
-  // A unique id for the graph and graphExec instances; they don't overlap
-  uint32_t graphId{};
-  // Total number of GPU kernels launched by this graph
-  size_t numNodes{1};
-};
-
-// Track pending graphs per device so flushing a single device won't drain
-// graphs from other devices.
-class PendingGraphQueue {
-public:
-  explicit PendingGraphQueue(Runtime *runtime) : runtime(runtime) {}
-
-  struct EntryLocator {
-    size_t phase{};
-    size_t entryId{};
-  };
-
-  struct PendingGraph {
-    std::map<Data *, std::vector<EntryLocator>> dataToEntryIds;
-    size_t numMetricNodes;
-  };
-  using PopResult = std::pair<size_t, std::vector<PendingGraph>>;
-
-  void push(const std::map<Data *, std::vector<EntryLocator>> &dataToEntryIds,
-            size_t numNodes) {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto device = runtime->getDevice();
-    auto &queue = deviceQueues[device];
-    queue.pendingGraphs.push_back(PendingGraph{dataToEntryIds, numNodes});
-    queue.totalNumNodes += numNodes;
-  }
-
-  PopResult pop(size_t numNewNodes, size_t capacity) {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (deviceQueues.empty()) {
-      return {0, {}};
-    }
-    auto device = runtime->getDevice();
-    auto &queue = deviceQueues[device];
-    if ((queue.totalNumNodes + numNewNodes) * 2 * sizeof(uint64_t) <=
-        capacity) {
-      return {0, {}};
-    }
-    return popLocked(queue);
-  }
-
-  std::vector<PopResult> popAll() {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (deviceQueues.empty()) {
-      return {{0, {}}};
-    }
-    std::vector<PopResult> results;
-    for (auto &[device, queue] : deviceQueues) {
-      results.emplace_back(popLocked(queue));
-    }
-    return results;
-  }
-
-private:
-  struct Queue {
-    size_t totalNumNodes{};
-    std::vector<PendingGraph> pendingGraphs;
-  };
-
-  PopResult popLocked(Queue &queue) {
-    std::vector<PendingGraph> items;
-    items.swap(queue.pendingGraphs);
-    size_t numNodes = queue.totalNumNodes;
-    queue.totalNumNodes = 0;
-    return {numNodes, items};
-  }
-
-  Runtime *runtime{};
-  std::map<void *, Queue> deviceQueues;
-  mutable std::mutex mutex;
-};
-
 } // namespace
 
 struct CuptiProfiler::CuptiProfilerPimpl
     : public GPUProfiler<CuptiProfiler>::GPUProfilerPimplInterface {
   CuptiProfilerPimpl(CuptiProfiler &profiler)
-      : GPUProfiler<CuptiProfiler>::GPUProfilerPimplInterface(profiler),
-        pendingGraphQueue(&CudaRuntime::instance()) {
-    runtime = &CudaRuntime::instance();
-    metricBuffer = std::make_unique<MetricBuffer>(1024 * 1024 * 64, runtime);
+      : GPUProfiler<CuptiProfiler>::GPUProfilerPimplInterface(profiler) {
+    auto runtime = &CudaRuntime::instance();
+    profiler.metricBuffer =
+        std::make_unique<MetricBuffer>(1024 * 1024 * 64, runtime,
+                                       /*mapped=*/true);
+    profiler.pendingGraphPool =
+        std::make_unique<PendingGraphPool>(profiler.metricBuffer.get());
   }
   virtual ~CuptiProfilerPimpl() = default;
 
@@ -418,7 +387,6 @@ struct CuptiProfiler::CuptiProfilerPimpl
   CuptiPCSampling pcSampling;
 
   ThreadSafeMap<uint32_t, GraphState> graphStates;
-  PendingGraphQueue pendingGraphQueue;
 
 private:
   void handleGraphResourceCallbacks(CuptiProfiler &profiler,
@@ -437,10 +405,6 @@ private:
                                     const CUpti_CallbackData *callbackData);
   void handleApiCallbacks(CuptiProfiler &profiler, CUpti_CallbackId cbId,
                           const void *cbData);
-
-  void emitMetricRecords(
-      uint64_t *recordPtr,
-      std::vector<PendingGraphQueue::PendingGraph> &pendingGraphs);
 };
 
 void CuptiProfiler::CuptiProfilerPimpl::allocBuffer(uint8_t **buffer,
@@ -487,56 +451,14 @@ void CuptiProfiler::CuptiProfilerPimpl::completeBuffer(CUcontext ctx,
   std::free(buffer);
 
   profiler.correlation.complete(maxCorrelationId);
-  profiler.flushDataPhases(dataFlushedPhases, dataPhases);
-}
-
-void CuptiProfiler::CuptiProfilerPimpl::emitMetricRecords(
-    uint64_t *recordPtr,
-    std::vector<PendingGraphQueue::PendingGraph> &pendingGraphs) {
-  for (auto &pendingGraph : pendingGraphs) {
-    auto graphMetricNodes = pendingGraph.numMetricNodes;
-    for (size_t i = 0; i < graphMetricNodes; ++i) {
-      auto metricId = recordPtr[0];
-      auto metricValue = recordPtr[1];
-      recordPtr += 2;
-      auto metricDesc = metricBuffer->getMetricDescriptor(metricId);
-      auto metricName = metricDesc.name;
-      auto metricTypeIndex = metricDesc.typeIndex;
-      for (auto &[data, entryIds] : pendingGraph.dataToEntryIds) {
-        const auto locator = entryIds[i];
-        switch (metricTypeIndex) {
-        case variant_index_v<uint64_t, MetricValueType>: {
-          uint64_t typedValue{};
-          std::memcpy(&typedValue, &metricValue, sizeof(typedValue));
-          data->addEntryMetrics(locator.phase, locator.entryId,
-                                {{metricName, MetricValueType{typedValue}}});
-          break;
-        }
-        case variant_index_v<int64_t, MetricValueType>: {
-          int64_t typedValue{};
-          std::memcpy(&typedValue, &metricValue, sizeof(typedValue));
-          data->addEntryMetrics(locator.phase, locator.entryId,
-                                {{metricName, MetricValueType{typedValue}}});
-          break;
-        }
-        case variant_index_v<double, MetricValueType>: {
-          double typedValue{};
-          std::memcpy(&typedValue, &metricValue, sizeof(typedValue));
-          data->addEntryMetrics(locator.phase, locator.entryId,
-                                {{metricName, MetricValueType{typedValue}}});
-          break;
-        }
-        default:
-          break;
-        }
-      }
-    }
-  }
+  profiler.flushDataPhases(dataFlushedPhases, dataPhases,
+                           profiler.pendingGraphPool.get());
 }
 
 void CuptiProfiler::CuptiProfilerPimpl::handleGraphResourceCallbacks(
     CuptiProfiler &profiler, CUpti_CallbackId cbId,
     CUpti_GraphData *graphData) {
+
   uint32_t graphId = 0;
   uint32_t graphExecId = 0;
   if (graphData->graph)
@@ -548,76 +470,75 @@ void CuptiProfiler::CuptiProfilerPimpl::handleGraphResourceCallbacks(
     uint64_t nodeId = 0;
     cupti::getGraphNodeId<true>(graphData->node, &nodeId);
     if (cbId == CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED) {
-      // When `cuGraphClone` or `cuGraphInstantiate` is called, CUPTI triggers
-      // both CREATED and CLONED callbacks for each node. So we only increase
-      // the numNodes in CREATED callback.
-      if (!graphStates.contain(graphId))
-        graphStates[graphId] = GraphState();
-      else
-        graphStates[graphId].numNodes++;
-      if (profiler.isOpInProgress()) {
-        auto &graphState = graphStates[graphId];
-        auto &nodeState = graphState.nodeIdToState[nodeId];
-        nodeState.nodeId = nodeId;
-        const auto &name = threadState.scopeStack.back().name;
-        if (name.empty() || (threadState.isApiExternOp &&
-                             threadState.isMetricKernelLaunching)) {
-          nodeState.isMissingName = true;
-        }
-        if (threadState.isMetricKernelLaunching) {
-          nodeState.isMetricNode = true;
-          graphState.metricKernelNodeIds.insert(nodeId);
-        }
-        for (auto *data : profiler.dataSet) {
-          auto contexts = data->getContexts();
-          if (!threadState.isApiExternOp ||
-              !threadState.isMetricKernelLaunching)
-            contexts.push_back(name);
-          nodeState.captureContexts[data] = std::move(contexts);
-          graphState
-              .dataToCallpathToNodeStates[data][nodeState.captureContexts[data]]
-              .push_back(std::ref(nodeState));
-        }
-      } // else no op in progress; creation triggered by graph clone/instantiate
+      if (!profiler.isOpInProgress()) {
+        // else no op in progress; creation triggered by graph
+        // clone/instantiate, we don't increase the numNodes because the
+        // original graph has already accounted for it
+        return;
+      }
+      auto &graphState = graphStates[graphId];
+      auto &nodeState = graphState.nodeIdToState[nodeId];
+      nodeState.nodeId = nodeId;
+      const auto &name = threadState.scopeStack.back().name;
+      if (name.empty() ||
+          (threadState.isApiExternOp && threadState.isMetricKernelLaunching)) {
+        nodeState.status.setMissingName();
+      }
+      if (threadState.isMetricKernelLaunching) {
+        nodeState.status.setMetricNode();
+        auto metricKernelNumWords =
+            threadState.metricKernelNumWordsQueue.front();
+        threadState.metricKernelNumWordsQueue.pop_front();
+        graphState.metricNodeIdToNumWords.insert_or_assign(
+            nodeId, metricKernelNumWords);
+        graphState.numMetricWords += metricKernelNumWords;
+      }
+      for (auto *data : profiler.dataSet) {
+        auto contexts = data->getContexts();
+        if (!threadState.isApiExternOp || !threadState.isMetricKernelLaunching)
+          contexts.push_back(name);
+        auto staticEntry =
+            data->addOp(Data::kVirtualPhase, Data::kRootEntryId, contexts);
+        nodeState.dataToEntryId.insert_or_assign(data, staticEntry.id);
+        graphState.dataToEntryIdToNodeStates[data][staticEntry.id].insert(
+            &nodeState);
+      }
     } else { // CUPTI_CBID_RESOURCE_GRAPHNODE_CLONED
       uint32_t originalGraphId = 0;
       uint64_t originalNodeId = 0;
       cupti::getGraphId<true>(graphData->originalGraph, &originalGraphId);
       cupti::getGraphNodeId<true>(graphData->originalNode, &originalNodeId);
+      auto &originalGraphState = graphStates[originalGraphId];
       auto &graphState = graphStates[graphId];
-      // Clone all node states.
       graphState.nodeIdToState[nodeId] =
-          graphStates[originalGraphId].nodeIdToState[originalNodeId];
+          originalGraphState.nodeIdToState[originalNodeId];
       auto &nodeState = graphState.nodeIdToState[nodeId];
       nodeState.nodeId = nodeId;
-      for (const auto &[data, callpath] : nodeState.captureContexts) {
-        graphState.dataToCallpathToNodeStates[data][callpath].push_back(
-            std::ref(nodeState));
+      for (const auto &[data, entryId] : nodeState.dataToEntryId) {
+        graphState.dataToEntryIdToNodeStates[data][entryId].insert(&nodeState);
       }
-      if (graphStates[originalGraphId].metricKernelNodeIds.find(
-              originalNodeId) !=
-          graphStates[originalGraphId].metricKernelNodeIds.end()) {
-        graphState.metricKernelNodeIds.insert(nodeId);
+      auto originalMetricNodeIt =
+          originalGraphState.metricNodeIdToNumWords.find(originalNodeId);
+      if (originalMetricNodeIt !=
+          originalGraphState.metricNodeIdToNumWords.end()) {
+        const auto numMetricWords = originalMetricNodeIt->second;
+        graphState.metricNodeIdToNumWords.insert_or_assign(nodeId,
+                                                           numMetricWords);
+        graphState.numMetricWords += numMetricWords;
       }
     }
   } else if (cbId == CUPTI_CBID_RESOURCE_GRAPHNODE_DESTROY_STARTING) {
-    auto &numNodes = graphStates[graphId].numNodes;
-    numNodes--;
+    auto &graphState = graphStates[graphId];
     uint64_t nodeId = 0;
     cupti::getGraphNodeId<true>(graphData->node, &nodeId);
-    auto &graphState = graphStates[graphId];
-    for (const auto &[data, callpath] :
-         graphState.nodeIdToState[nodeId].captureContexts) {
-      auto &nodeStates = graphState.dataToCallpathToNodeStates[data][callpath];
-      nodeStates.erase(
-          std::remove_if(nodeStates.begin(), nodeStates.end(),
-                         [nodeId](const GraphState::NodeStateRef &state) {
-                           return state.get().nodeId == nodeId;
-                         }),
-          nodeStates.end());
+    graphState.numMetricWords -= graphState.metricNodeIdToNumWords[nodeId];
+    for (const auto &[data, entryId] :
+         graphState.nodeIdToState[nodeId].dataToEntryId) {
+      graphState.dataToEntryIdToNodeStates[data][entryId].erase(
+          &graphState.nodeIdToState[nodeId]);
     }
     graphState.nodeIdToState.erase(nodeId);
-    graphState.metricKernelNodeIds.erase(nodeId);
+    graphState.metricNodeIdToNumWords.erase(nodeId);
   } else if (cbId == CUPTI_CBID_RESOURCE_GRAPH_DESTROY_STARTING) {
     graphStates.erase(graphId);
   } else if (cbId == CUPTI_CBID_RESOURCE_GRAPHEXEC_DESTROY_STARTING) {
@@ -649,7 +570,8 @@ void CuptiProfiler::CuptiProfilerPimpl::handleResourceCallbacks(
   } else {
     auto *graphData =
         static_cast<CUpti_GraphData *>(resourceData->resourceDescriptor);
-    handleGraphResourceCallbacks(profiler, cbId, graphData);
+    if (graphData->nodeType == CU_GRAPH_NODE_TYPE_KERNEL)
+      handleGraphResourceCallbacks(profiler, cbId, graphData);
   }
 }
 
@@ -671,7 +593,7 @@ bool CuptiProfiler::CuptiProfilerPimpl::handleStreamCaptureCallbacks(
       cbId == CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture_v2 ||
       cbId == CUPTI_DRIVER_TRACE_CBID_cuStreamBeginCapture_v2_ptsz) {
     threadState.isStreamCapturing = true;
-    metricBuffer->reserve();
+    profiler.metricBuffer->reserve();
     return true;
   }
   if (cbId == CUPTI_DRIVER_TRACE_CBID_cuStreamEndCapture ||
@@ -712,7 +634,8 @@ void CuptiProfiler::CuptiProfilerPimpl::handleApiEnterLaunchCallbacks(
     numNodes = std::numeric_limits<size_t>::max();
     auto findGraph = false;
     if (graphStates.contain(graphExecId)) {
-      numNodes = graphStates[graphExecId].numNodes;
+      if (!graphStates[graphExecId].captureStatusChecked)
+        numNodes = graphStates[graphExecId].nodeIdToState.size();
       findGraph = true;
     }
     if (!findGraph && !graphStates[graphExecId].captureStatusChecked) {
@@ -721,10 +644,10 @@ void CuptiProfiler::CuptiProfilerPimpl::handleApiEnterLaunchCallbacks(
                 << ", and t may cause memory leak. To avoid this problem, "
                    "please start profiling before the graph is created."
                 << std::endl;
-    } else if (findGraph) {
+    } else if (findGraph && !graphStates[graphExecId].captureStatusChecked) {
       auto &graphState = graphStates[graphExecId];
 
-      // For each unique call path, we generate a scope id per data object.
+      // For each unique call path, we generate an entry per data object.
       auto &graphNodeIdToState =
           profiler.correlation.externIdToState[scope.scopeId]
               .graphNodeIdToState;
@@ -735,26 +658,35 @@ void CuptiProfiler::CuptiProfilerPimpl::handleApiEnterLaunchCallbacks(
       } else {
         graphNodeIdToState.clear();
       }
-      for (auto &[data, callpathToNodeStates] :
-           graphState.dataToCallpathToNodeStates) {
-        auto *dataPtr = data;
-        auto entryIt = dataToEntry.find(dataPtr);
-        if (entryIt == dataToEntry.end())
-          continue;
-        auto baseEntry =
-            dataPtr->addOp(entryIt->second.phase, entryIt->second.id,
-                           {Context{GraphState::captureTag}});
-        for (const auto &[callpath, nodeStates] : callpathToNodeStates) {
-          const auto nodeEntry =
-              dataPtr->addOp(baseEntry.phase, baseEntry.id, callpath);
-          for (const auto &nodeStateRef : nodeStates) {
-            const auto &nodeState = nodeStateRef.get();
-            auto &graphNodeState = graphNodeIdToState.emplace(nodeState.nodeId);
-            graphNodeState.isMissingName = nodeState.isMissingName;
-            graphNodeState.isMetricNode = nodeState.isMetricNode;
-            graphNodeState.setEntry(data, nodeEntry);
-          }
-        }
+      static const bool timingEnabled =
+          getBoolEnv("PROTON_GRAPH_LAUNCH_TIMING", false);
+      using Clock = std::chrono::steady_clock;
+      auto t0 = decltype(Clock::now()){};
+      if (timingEnabled)
+        t0 = Clock::now();
+
+      buildGraphNodeEntries(dataToEntry, graphState, graphNodeIdToState);
+
+      if (timingEnabled) {
+        auto t1 = Clock::now();
+        auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        std::cerr << "[PROTON] Graph launch call path time: " << elapsed
+                  << " us for graphExecId: " << graphExecId << std::endl;
+        t0 = Clock::now();
+      }
+
+      queueGraphMetrics(dataToEntry, profiler.pendingGraphPool.get(),
+                        callbackData, graphState, graphNodeIdToState);
+
+      if (timingEnabled) {
+        auto t1 = Clock::now();
+        auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count();
+        std::cerr << "[PROTON] Graph launch metric time: " << elapsed
+                  << " us for graphExecId: " << graphExecId << std::endl;
       }
     }
   }
@@ -775,46 +707,6 @@ void CuptiProfiler::CuptiProfilerPimpl::handleApiExitLaunchCallbacks(
     auto &dataToEntry = threadState.dataToEntry;
     // XXX: Conservatively stop every GPU kernel for now.
     pcSampling.stop(callbackData->context, dataToEntry);
-  }
-
-  if (isGraphLaunch(cbId)) {
-    // Cuda context can be lazily initialized, so we need to call device get
-    // here after the first kernel is launched.
-    auto graphExec =
-        static_cast<const cuGraphLaunch_params *>(callbackData->functionParams)
-            ->hGraph;
-    uint32_t graphExecId = 0;
-    cupti::getGraphExecId<true>(graphExec, &graphExecId);
-    auto graphRef = graphStates.find(graphExecId);
-    if (graphRef.has_value() &&
-        !graphRef.value().get().metricKernelNodeIds.empty()) {
-      std::map<Data *, std::vector<PendingGraphQueue::EntryLocator>>
-          metricNodeEntryIds;
-      auto &graphExecState = graphRef.value().get();
-      auto &externIdState =
-          profiler.correlation
-              .externIdToState[threadState.scopeStack.back().scopeId];
-      for (auto nodeId : graphExecState.metricKernelNodeIds) {
-        auto *nodeState = externIdState.graphNodeIdToState.find(nodeId);
-        if (!nodeState)
-          continue;
-        nodeState->forEachEntry([&](Data *data, const DataEntry &entry) {
-          metricNodeEntryIds[data].push_back(
-              PendingGraphQueue::EntryLocator{entry.phase, entry.id});
-        });
-      }
-      auto metricBufferCapacity = metricBuffer->getCapacity(); // bytes
-      auto metricNodeCount = graphExecState.metricKernelNodeIds.size();
-      auto drained =
-          pendingGraphQueue.pop(metricNodeCount, metricBufferCapacity);
-      if (drained.first != 0) { // Reached capacity
-        metricBuffer->flush([&](uint8_t *data, size_t dataSize) {
-          auto *recordPtr = reinterpret_cast<uint64_t *>(data);
-          emitMetricRecords(recordPtr, drained.second);
-        });
-      }
-      pendingGraphQueue.push(metricNodeEntryIds, metricNodeCount);
-    }
   }
 
   threadState.exitOp();
@@ -862,6 +754,8 @@ void CuptiProfiler::CuptiProfilerPimpl::doStart() {
     cupti::activityEnable<true>(CUPTI_ACTIVITY_KIND_KERNEL);
   } else {
     cupti::activityEnable<true>(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+    if (getBoolEnv("TRITON_ENABLE_HW_TRACE", false))
+      cupti::activityEnableHWTrace<true>(/*enable=*/1);
   }
   cupti::activityRegisterCallbacks<true>(allocBuffer, completeBuffer);
   setGraphCallbacks(subscriber, /*enable=*/true);
@@ -897,16 +791,7 @@ void CuptiProfiler::CuptiProfilerPimpl::doFlush() {
   // new activities.
   cupti::activityFlushAll<true>(/*flag=*/CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
   // Flush the tensor metric buffer
-  if (auto popResult = pendingGraphQueue.popAll(); !popResult.empty()) {
-    auto resultIdx = 0;
-    metricBuffer->flush(
-        [&](uint8_t *data, size_t dataSize) {
-          auto *recordPtr = reinterpret_cast<uint64_t *>(data);
-          emitMetricRecords(recordPtr, popResult[resultIdx].second);
-          resultIdx++;
-        },
-        /*flushAll=*/true);
-  }
+  profiler.pendingGraphPool->flushAll();
 }
 
 void CuptiProfiler::CuptiProfilerPimpl::doStop() {
@@ -920,6 +805,8 @@ void CuptiProfiler::CuptiProfilerPimpl::doStop() {
     cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_KERNEL);
   } else {
     cupti::activityDisable<true>(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+    if (getBoolEnv("TRITON_ENABLE_HW_TRACE", false))
+      cupti::activityEnableHWTrace<true>(/*enable=*/0);
   }
   profiler.periodicFlushingEnabled = false;
   profiler.periodicFlushingFormat.clear();

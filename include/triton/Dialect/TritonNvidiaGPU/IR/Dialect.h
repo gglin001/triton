@@ -38,13 +38,16 @@
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h.inc"
 
+#define GET_TYPEDEF_CLASSES
+#include "triton/Dialect/TritonNvidiaGPU/IR/Types.h.inc"
+
 namespace mlir::triton::nvidia_gpu::impl {
 LogicalResult verifyMMAv5Op(Operation *op);
 } // namespace mlir::triton::nvidia_gpu::impl
 
-#define GET_ATTRDEF_CLASSES
 #include "triton/Dialect/TritonNvidiaGPU/IR/OpsEnums.h.inc"
 
+#define GET_ATTRDEF_CLASSES
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUAttrDefs.h.inc"
 
 #include "triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOpInterfaces.h.inc"
@@ -114,6 +117,8 @@ LinearLayout getTileLayout(MLIRContext *ctx, TMemAccessAtom atom, bool unpacked,
 
 TMemAllocation getTmemAllocSizes(gpu::MemDescType memDescType);
 
+uint32_t getTMemSubSliceOffset(gpu::MemDescType memDescType, int32_t nOffset);
+
 SmallVector<gpu::DistributedEncodingTrait>
 getTmemCompatibleLayouts(gpu::MemDescType memType, unsigned numWarps,
                          ArrayRef<int64_t> ctaSplit = {1, 1});
@@ -131,13 +136,11 @@ bool isDistributedLayoutTMemCompatible(Operation *op,
                                        gpu::MemDescType memType);
 
 gpu::DistributedEncodingTrait
-getDefaultLayoutForTmemLdSt(gpu::MemDescType memType, unsigned numWarps,
-                            gpu::CGAEncodingAttr cgaLayout);
+getDefaultLayoutForTmemLdSt(gpu::MemDescType memType, unsigned numWarps);
 
 std::optional<LinearLayout>
 getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
-                                unsigned numWarps,
-                                gpu::CGAEncodingAttr cgaLayout);
+                                unsigned numWarps);
 
 } // namespace mlir::triton::nvidia_gpu
 

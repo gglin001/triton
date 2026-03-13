@@ -431,9 +431,16 @@ Value convertAndCastTensor(PatternRewriter &rewriter, Value value,
     else if (oldElemType.isF32() && newElemType.isF16())
       castedTensor =
           arith::TruncFOp::create(rewriter, loc, castedType, convertedTensor);
-    else
-      castedTensor =
-          tt::FpToFpOp::create(rewriter, loc, castedType, convertedTensor);
+    else {
+      RoundingModeAttr rmode;
+      if (oldElemType.getIntOrFloatBitWidth() >
+          newElemType.getIntOrFloatBitWidth()) {
+        rmode =
+            RoundingModeAttr::get(rewriter.getContext(), RoundingMode::RTNE);
+      }
+      castedTensor = tt::FpToFpOp::create(rewriter, loc, castedType,
+                                          convertedTensor, rmode);
+    }
   }
   return castedTensor;
 }
@@ -1305,6 +1312,8 @@ public:
       return rewriter.notifyMatchFailure(dotOp, "Not supported yet mxfp type");
     }
 
+    unsigned scaleFactor = dotOp.deduceScaleFactor();
+
     MLIRContext *ctx = dotOp.getContext();
 
     ttg::CGAEncodingAttr cgaLayout =
@@ -1363,31 +1372,53 @@ public:
     a = convertInputLayout(a, 0, aElemType == ScaleDotElemType::E2M1);
     b = convertInputLayout(b, 1, bElemType == ScaleDotElemType::E2M1);
 
+    auto getDefaultScaleTypeValue = [&](int idx) -> std::pair<Type, Attribute> {
+      // If both scales are absent, use E8M0 for generality
+      if (!aScale && !bScale) {
+        return {i8_ty, rewriter.getIntegerAttr(i8_ty, 0x7F)};
+      }
+
+      if (aElemType == ScaleDotElemType::E2M1 &&
+          bElemType == ScaleDotElemType::E2M1) {
+        // Fp4 x Fp4 requires to use the same scale dtype for both operands.
+        TensorValue otherScale = idx == 0 ? bScale : aScale;
+        Type f8Ty = otherScale.getType().getElementType();
+        return {f8Ty, FloatAttr::get(f8Ty, 1.0)};
+      }
+
+      return {i8_ty, rewriter.getIntegerAttr(i8_ty, 0x7F)};
+    };
+
     auto convertScaleLayout = [&](TensorValue scale,
                                   llvm::ArrayRef<int64_t> valShape,
                                   LinearLayout dotLL, int idx) -> Value {
       SmallVector<int64_t> shape;
+      Type scaleType;
+      // 0x7F is 1.0 in E8M0
+      Attribute scaleValue = rewriter.getIntegerAttr(i8_ty, 0x7F);
       if (!scale) {
         int64_t nonKDim = idx == 0 ? valShape[0] : valShape[1];
         int64_t k = idx == 0 ? valShape[1] : valShape[0];
         ScaleDotElemType &elemType = idx == 0 ? aElemType : bElemType;
         int packSize = elemType == ScaleDotElemType::E2M1 ? 2 : 1;
-        shape = {nonKDim, k * packSize / 32};
+        shape = {nonKDim, k * packSize / scaleFactor};
+        std::tie(scaleType, scaleValue) = getDefaultScaleTypeValue(idx);
       } else {
+        scaleType = scale.getType().getElementType();
         shape = llvm::to_vector(scale.getType().getShape());
       }
 
-      LinearLayout newLL =
-          ttg::chooseScaledWmmaScaleLayout(ctx, idx, shape, mDim, ctaLayout);
+      LinearLayout newLL = ttg::chooseScaledWmmaScaleLayout(
+          ctx, idx, shape, mDim, scaleFactor, ctaLayout,
+          triton::gpu::CGAEncodingAttr::get1CTALayout(ctx, /*rank=*/2));
       Attribute newScaleEncoding = ttg::LinearEncodingAttr::get(ctx, newLL);
-      // Scale's data type is always i8
-      auto newScaleType = RankedTensorType::get(shape, i8_ty, newScaleEncoding);
+      auto newScaleType =
+          RankedTensorType::get(shape, scaleType, newScaleEncoding);
 
       if (!scale) {
-        // 0x7F is 1.0 in E8M0
-        return arith::ConstantOp::create(
-            rewriter, dotOp->getLoc(), newScaleType,
-            DenseElementsAttr::get(newScaleType, llvm::APInt(8, 0x7F)));
+        auto denseAttr = DenseElementsAttr::get(newScaleType, scaleValue);
+        return arith::ConstantOp::create(rewriter, dotOp->getLoc(),
+                                         newScaleType, denseAttr);
       } else {
         return ttg::ConvertLayoutOp::create(rewriter, scale.getLoc(),
                                             newScaleType, scale);
@@ -1400,7 +1431,8 @@ public:
 
     auto newDot = triton::DotScaledOp::create(
         rewriter, dotOp.getLoc(), newRetType, a, b, newAcc, newAScale,
-        newBScale, aElemType, bElemType, dotOp.getFastMath());
+        newBScale, aElemType, bElemType, dotOp.getFastMath(),
+        dotOp.getLhsKPack(), dotOp.getRhsKPack());
 
     auto m = dotOp->getParentOfType<ModuleOp>();
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(dotOp, oldRetType,
@@ -1424,13 +1456,11 @@ static void decomposeMixedModeDotOp(ModuleOp mod) {
     auto D = dotOp.getD();
     OpBuilder builder(dotOp);
     Type AElType = dotOp.getA().getType().getElementType();
+    Type BElType = dotOp.getB().getType().getElementType();
+    auto maxBitWidth = std::max(AElType.getIntOrFloatBitWidth(),
+                                BElType.getIntOrFloatBitWidth());
     Type promoteType;
     if (isa<ttg::AMDMfmaEncodingAttr>(D.getType().getEncoding())) {
-      Type BElType = dotOp.getB().getType().getElementType();
-
-      auto maxBitWidth = std::max(AElType.getIntOrFloatBitWidth(),
-                                  BElType.getIntOrFloatBitWidth());
-
       // TODO check mfma tensor core version compatibility
       if (maxBitWidth == 8)
         return;
@@ -1443,7 +1473,8 @@ static void decomposeMixedModeDotOp(ModuleOp mod) {
       else if (maxBitWidth <= 32)
         promoteType = builder.getF32Type();
     } else if (isa<ttg::AMDWmmaEncodingAttr>(D.getType().getEncoding())) {
-      Type BElType = dotOp.getB().getType().getElementType();
+      if (maxBitWidth == 8)
+        return;
 
       if (AElType == BElType)
         return;
@@ -1542,6 +1573,11 @@ public:
     if (operandTypes.empty())
       return failure();
 
+    auto kDimTensor = aShape.back();
+    if (kDimTensor == 1) {
+      return rewriter.notifyMatchFailure(dotOp,
+                                         "Skipping WMMA for dot op with K=1");
+    }
     // check shape
     FailureOr<WmmaIntrinsic> wmmaInstr =
         chooseWmmaInstruction(dotOp, operandTypes, wmmaVersion);
@@ -1558,7 +1594,7 @@ public:
     // get WMMA encoding for the given number of warps
     int numWarps = ttg::lookupNumWarps(dotOp);
 
-    ttg::AMDWmmaEncodingAttr wmmaEnc;
+    ttg::AMDWmmaEncodingAttr wmmaEnc, wmmaEncA, wmmaEncB;
 
     auto warpsPerTile =
         warpsPerTileWMMA(dotOp, retShape, numWarps, {mDim, nDim});
@@ -1583,8 +1619,14 @@ public:
     auto newAcc =
         convertAndCastTensor(rewriter, oldAcc, wmmaEnc, operandTypes[2]);
 
-    // kWidth is always 8 for WMMA v3, and equals to kBase for WMMA v1/2
-    auto kWidth = wmmaVersion == 3 ? 8 : kBase;
+    auto kWidth = 0;
+    // Adjust kWidth=kDimTensor/2 when kDimTensor < kDim
+    if (kDimTensor < kDim) {
+      kWidth = kDimTensor / 2;
+    } else {
+      // kWidth is always 8 for WMMA v3, and equals to kBase for WMMA v1/2
+      kWidth = wmmaVersion == 3 ? 8 : kBase;
+    }
     auto newAType = RankedTensorType::get(
         aShape, operandTypes[0],
         ttg::DotOperandEncodingAttr::get(ctx, 0, wmmaEnc, kWidth));

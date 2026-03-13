@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import triton
 from triton_kernels import target_info
-from triton_kernels.target_info import get_cdna_version, get_rdna_version
+from triton_kernels.target_info import get_cdna_version, get_rdna_version, cuda_capability_geq
 from triton_kernels.tensor import FP4, FP32, Tensor
 import torch
 from triton_kernels.tensor_details.layout_details.hopper_scale import HopperMXScaleLayout
@@ -27,6 +27,7 @@ class OptFlags:
     idle_sms: int
     epilogue_subtile: int | None
     arch: str
+    occupancy_target: int
     target_kernel_kwargs: dict
 
 
@@ -166,6 +167,7 @@ def make_default_opt_flags_amd(
         epilogue_subtile=epilogue_subtile,
         arch=None,
         target_kernel_kwargs=target_kernel_kwargs,
+        occupancy_target=1,
     )
     # check constraints
     all_constraints_satisfied(ret, constraints)
@@ -189,7 +191,7 @@ def make_default_opt_flags_nvidia(
     has_y_acc_in,
     constraints,
 ):
-    constraints_supported = {"block_m", "block_k", "split_k", "is_persistent", "epilogue_subtile", "num_stages", "idle_sms", "max_allowable_mn", "num_warps"}
+    constraints_supported = {"block_m", "block_n", "block_k", "split_k", "is_persistent", "epilogue_subtile", "num_stages", "idle_sms", "max_allowable_mn", "num_warps"}
     unsupported = set(constraints.keys()) - constraints_supported
     assert not unsupported, f"Given unsupported constraint: {unsupported}"
     # tokens per expert
@@ -226,7 +228,13 @@ def make_default_opt_flags_nvidia(
             block_m = max(16, min(triton.next_power_of_2(slice_size), 128))
     # block n
     arch = None
-    block_n, block_n_tma = opt_flags_nvidia.compute_block_n(n, arch, precision_config)
+    if constraints.get("block_n", None) is not None:
+        # A single block_n constraint should apply consistently to both the
+        # regular and persistent/TMA paths.
+        block_n = constraints["block_n"]
+        block_n_tma = constraints["block_n"]
+    else:
+        block_n, block_n_tma = opt_flags_nvidia.compute_block_n(n, arch, precision_config)
     # is_persistent
     grid_size_tma = opt_flags_nvidia.compute_grid_size(routing_data, batch_size, m, n, block_m, block_n_tma)
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -234,9 +242,6 @@ def make_default_opt_flags_nvidia(
     supports_persistent = can_use_persistent_tma and (arch is None or int(arch[2:-1]) >= 9)
     a_mx_scale_layout = None if not isinstance(precision_config.a_mx_scale, Tensor) else precision_config.a_mx_scale.storage.layout
     b_mx_scale_layout = None if not isinstance(precision_config.b_mx_scale, Tensor) else precision_config.b_mx_scale.storage.layout
-    if isinstance(b_mx_scale_layout, HopperMXScaleLayout) and b_mx_scale_layout.num_warps == 4:
-        # TODO: persistent kernel is broken due with 4 warps due to a ptxas bug
-        supports_persistent = False
 
     def _is_layout_strided(layout: Layout | None) -> bool:
         return layout is None or isinstance(layout, StridedLayout)
@@ -249,7 +254,7 @@ def make_default_opt_flags_nvidia(
         is_persistent = True
     else:
         has_simple_epilogue = precision_config.max_num_imprecise_acc is None
-        is_persistent = supports_persistent and has_simple_epilogue and (tiles_per_sm >= 2.0 or lhs_dtype.bitwidth <= 8) and out_dtype.bitwidth < 32
+        is_persistent = supports_persistent and has_simple_epilogue and (tiles_per_sm >= 2.0 or lhs_dtype.bitwidth <= 8) and (out_dtype.bitwidth < 32 or lhs_dtype.bitwidth == 32 or rhs_dtype.bitwidth == 32)
         # TMA is slower for batched matmuls with small m/n/k.
         if m * n * k < 131072:
             is_persistent = False
@@ -294,20 +299,37 @@ def make_default_opt_flags_nvidia(
         has_y_acc_in,
     )
 
+    num_warps = opt_flags_nvidia.compute_num_warps(block_m, block_n, is_persistent, precision_config, constraints)
+
+    # Occupancy target and maxnreg (for Hopper)
+    occupancy_target = 1
+    is_hopper_scale = isinstance(b_mx_scale_layout, HopperMXScaleLayout)
+    if is_hopper_scale:
+        occupancy_target = 16 // num_warps
+    threads_per_warp = 32
+    reg_per_sm = 64 * 1024
+    max_reg_per_thread = 256
+    is_blackwell_or_newer = cuda_capability_geq(10, 0)
+    if is_persistent and not is_blackwell_or_newer:
+        maxnreg = reg_per_sm // (num_warps * threads_per_warp * occupancy_target)
+        maxnreg = min(max_reg_per_thread, maxnreg)
+    else:
+        maxnreg = None
+
     if constraints.get("epilogue_subtile", None) is not None:
         subtiles_to_check = [constraints["epilogue_subtile"]]
     else:
         subtiles_to_check = [1, 2, 4]
     num_stages = -1
     for ep in subtiles_to_check:
-        ns = opt_flags_nvidia.compute_num_stages(*compute_num_stages_args, epilogue_subtile=ep)
+        ns = opt_flags_nvidia.compute_num_stages(*compute_num_stages_args, epilogue_subtile=ep,
+                                                 occupancy_target=occupancy_target)
         if ns > num_stages:
             epilogue_subtile, num_stages = ep, ns
 
     if constraints.get("num_stages", None):
         num_stages = constraints["num_stages"]
     assert num_stages >= 1
-    num_warps = opt_flags_nvidia.compute_num_warps(block_m, block_n, is_persistent, precision_config, constraints)
     ret = OptFlags(
         block_m=block_m,
         block_n=block_n,
@@ -321,8 +343,13 @@ def make_default_opt_flags_nvidia(
         is_persistent=is_persistent,
         epilogue_subtile=epilogue_subtile,
         arch=arch,
-        target_kernel_kwargs=dict(),
+        target_kernel_kwargs=dict(
+            maxnreg=maxnreg,
+            # For some reason, overlapping the epilogue is slower for hopper bf16 x mxfp4
+            FLATTEN_LOOPS=not is_hopper_scale,
+        ),
         idle_sms=constraints.get("idle_sms", 0),
+        occupancy_target=occupancy_target,
     )
     # check constraints
     all_constraints_satisfied(ret, constraints)

@@ -14,6 +14,7 @@ from numpy.random import RandomState
 
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from triton._internal_testing import (
     integral_dtypes,
@@ -75,9 +76,9 @@ elif is_hip():
     # for CDNA multiple variants of mma instructions are supported:
     # mfma 16x16/mfma 32x32
     # 0 is a special value for automatic heuristic
-    if is_hip_cdna() or is_hip_gfx1250():
+    if is_hip_cdna():
         mma_nonk_sizes = [0, 16, 32]
-    elif is_hip_rdna3() or is_hip_rdna4():
+    elif is_hip_rdna3() or is_hip_rdna4() or is_hip_gfx1250():
         mma_nonk_sizes = [16]
 else:
     THREADS_PER_WARP = 32
@@ -1034,7 +1035,7 @@ def test_abs(dtype_x, device):
 
 
 @pytest.mark.interpreter
-@pytest.mark.parametrize("in_dtype", [tl.float8e4b15, tl.float8e4nv, tl.float8e5])
+@pytest.mark.parametrize("in_dtype", [tl.float8e4b15, tl.float8e4nv, tl.float8e5, tl.float8e4b8, tl.float8e5b16])
 def test_abs_fp8(in_dtype, device):
     if is_hip():
         pytest.skip('test_abs_fp8 not supported on HIP.')
@@ -1044,6 +1045,8 @@ def test_abs_fp8(in_dtype, device):
             pytest.skip("float8e4b15 not supported on CUDA >= 9.0")
         if in_dtype == tl.float8e4nv and cc < (8, 9):
             pytest.skip("float8e4nv not supported on CUDA < 8.9")
+        if in_dtype in (tl.float8e4b8, tl.float8e5b16):
+            pytest.skip("float8e4b8/float8e5b16 not supported on CUDA")
 
     @triton.jit
     def abs_kernel(X, Z, SIZE: tl.constexpr):
@@ -1381,7 +1384,9 @@ def test_atomic_rmw(op, dtype_x_str, mode, sem, device):
     # atom.add.bf16 is unsupported prior to Hopper so instead we generate an
     # atom.cas add loop on Ampere and prior
     if dst_type == 'bfloat16' and torch.cuda.get_device_capability()[0] < 9:
-        assert f"atom.{sem_str}.gpu.global.cas" in h.asm["ptx"]
+        assert "atom.relaxed.gpu.global.cas" in h.asm["ptx"]
+        if sem_str != "relaxed":
+            assert "fence.acq_rel.gpu" in h.asm["ptx"]
         return
 
     assert f"atom.global.gpu.{sem_str}" in h.asm["ptx"]
@@ -1918,25 +1923,57 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str, num_warps",
                          [(dtype_str, num_warps) for dtype_str in int_dtypes + float_dtypes for num_warps in [4, 8]])
-def test_cat(dtype_str, num_warps, device):
+@pytest.mark.parametrize("can_reorder", [True, False])
+def test_cat(dtype_str, num_warps, can_reorder, device):
     check_type_supported(dtype_str, device)
 
     @triton.jit
-    def kernel(X, Y, Z, N: tl.constexpr):
+    def kernel(X, Y, Z, N: tl.constexpr, CAN_REORDER: tl.constexpr):
         offs = tl.arange(0, N)
         x = tl.load(X + offs)
         y = tl.load(Y + offs)
-        z = tl.cat(x, y, can_reorder=True)
+        z = tl.cat(x, y, can_reorder=CAN_REORDER)
         tl.store(Z + tl.arange(0, 2 * N), z)
 
     x = torch.arange(0, 128, device=device).to(getattr(torch, dtype_str))
     y = torch.arange(-128, 0, device=device).to(getattr(torch, dtype_str))
-    z_ref = torch.cat([x, y], dim=0).sum()
+    z_ref = torch.cat([x, y], dim=0)
     z = torch.zeros((256, ), dtype=getattr(torch, dtype_str), device=device)
-    kernel[(1, )](x, y, z, N=128, num_warps=num_warps)
-    assert z.sum() == z_ref
+    kernel[(1, )](x, y, z, N=128, num_warps=num_warps, CAN_REORDER=can_reorder)
+    assert z.sum() == z_ref.sum()
+    if not can_reorder:
+        torch.testing.assert_close(z, z_ref, atol=0, rtol=0)
     # check if there's no duplicate value in z
     assert z.unique().size(0) == z.size(0)
+
+
+CAT_ND_SHAPES = ((128, ), (16, 32), (8, 16, 4), (2, 4, 8, 16))
+CAT_ND_CASES = []
+for shape in CAT_ND_SHAPES:
+    for dim in range(len(shape)):
+        CAT_ND_CASES.append(pytest.param(shape, dim, id=f"rank={len(shape)},dim={dim}"))
+
+
+@pytest.mark.parametrize("shape, dim", CAT_ND_CASES)
+def test_cat_nd(shape, dim, device):
+
+    @triton.jit
+    def kernel(x_desc, y_desc, z_desc, dim: tl.constexpr, shape: tl.constexpr):
+        rank: tl.constexpr = len(shape)
+        x = x_desc.load([0] * rank)
+        y = y_desc.load([0] * rank)
+        z = tl.cat(x, y, dim=dim)
+        z_desc.store([0] * rank, z)
+
+    x = torch.rand(shape, device=device)
+    y = torch.rand(shape, device=device)
+    z_ref = torch.cat([x, y], dim=dim)
+    z = torch.empty_like(z_ref)
+    x_desc = TensorDescriptor.from_tensor(x, block_shape=shape)
+    y_desc = TensorDescriptor.from_tensor(y, block_shape=shape)
+    z_desc = TensorDescriptor.from_tensor(z, block_shape=z_ref.shape)
+    kernel[(1, )](x_desc, y_desc, z_desc, dim=dim, shape=shape)
+    torch.testing.assert_close(z, z_ref, atol=0, rtol=0)
 
 
 @pytest.mark.interpreter
@@ -2748,8 +2785,10 @@ def test_histogram(M, N, device):
     # https://github.com/pytorch/pytorch/issues/74236
     # This is a workload by converting the input to float
     z_torch = torch.histc(x.float(), bins=N, min=0, max=N - 1)
-    histogram_kernel[(1, )](x, z, M=M, N=N)
+    h = histogram_kernel[(1, )](x, z, M=M, N=N)
     assert (z_torch == z).all()
+    if is_cuda() and not is_interpreter():
+        assert "ATOMS.POPC.INC" in h.asm["sass"]
 
 
 @pytest.mark.interpreter
@@ -3261,6 +3300,8 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
                 pytest.skip(f"{in_dtype} only supported on CDNA4, RDNA4 and above")
             if in_dtype in ("float8e5b16", "float8e4b8") and not is_hip_cdna3():
                 pytest.skip(f"{in_dtype} only supported on CDNA3")
+            if input_precision in ("bf16x3", "bf16x6") and is_hip_gfx1250():
+                pytest.skip(f"{input_precision} not fully supported on gfx1250")
             if not ((input_precision in ("bf16x3", "bf16x6")) or (input_precision == "ieee") or
                     (input_precision == "tf32" and is_hip_cdna3())):
                 pytest.skip(f"{input_precision} not supported on HIP")
@@ -3473,7 +3514,9 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         else:
             assert re.search(r'[mma|wgmma.mma_async].sync.aligned.m\d+n\d+k16(?:.row.col)?.f16.f16.f16', ptx)
     elif in_dtype == 'int8':
-        if capability[0] == 7 and capability[1] == 5:  # Turing
+        if is_tcgen5:
+            assert re.search(r'tcgen05.mma.cta_group::1.kind::i8', ptx)
+        elif capability[0] == 7 and capability[1] == 5:  # Turing
             assert 'mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32' in ptx
         else:
             assert 'wgmma.mma_async.sync.aligned' in ptx or\
@@ -5518,19 +5561,24 @@ def test_poison_return(device):
 
 
 def test_num_threads(device):
-    if is_hip():
-        pytest.skip("test_num_threads is not supported in HIP")
+    check_cuda_or_hip(device)
 
     @triton.jit
-    def kernel(Out):
-        num_threads: tl.constexpr = tl.extra.cuda.num_threads()
+    def kernel(Out, get_num_threads: tl.constexpr):
+        num_threads: tl.constexpr = get_num_threads()
         offs = tl.arange(0, num_threads)
         tl.store(Out + offs, 1)
 
+    if is_hip():
+        get_num_threads = tl.extra.hip.num_threads
+        warp_size = triton.runtime.driver.active.get_current_target().warp_size
+    else:
+        get_num_threads = tl.extra.cuda.num_threads
+        warp_size = 32
     num_threads = 256
     out = to_triton(np.zeros((num_threads, ), dtype=np.int32), device=device)
-    kernel[(1, )](out, num_warps=num_threads // 32)
-    assert torch.sum(out) == 256
+    kernel[(1, )](out, get_num_threads=get_num_threads, num_warps=num_threads // warp_size)
+    assert torch.sum(out) == num_threads
 
 
 def test_globaltimer(device):
@@ -5567,18 +5615,23 @@ def test_globaltimer(device):
 
 
 def test_smid(device):
-    if is_hip():
-        pytest.skip("test_smid is not supported in HIP")
     check_cuda_or_hip(device)
 
     @triton.jit
-    def kernel(Out):
-        tl.store(Out + tl.program_id(0), tl.extra.cuda.smid())
+    def kernel(Out, get_smid: tl.constexpr):
+        tl.store(Out + tl.program_id(0), get_smid())
 
+    if is_hip():
+        get_smid = tl.extra.hip.smid
+    else:
+        get_smid = tl.extra.cuda.smid
     out = to_triton(np.zeros((1024, ), dtype=np.int32), device=device)
-    h = kernel[(out.shape[0], )](out)
+    h = kernel[(out.shape[0], )](out, get_smid=get_smid)
     assert out.sort()[0].unique().shape[0] > 0
-    assert h.asm["ptx"].count("%smid") == 1
+    if is_cuda():
+        assert h.asm["ptx"].count("%smid") == 1
+    else:
+        assert h.asm["amdgcn"].count("s_getreg_b32") >= 1
 
 
 @pytest.mark.interpreter

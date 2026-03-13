@@ -184,7 +184,7 @@ LogicalResult ExtractSliceOp::verify() {
 // operations. When extract_slice is used to extract a portion that exactly
 // matches one of the original tensors concatenated by a concat operation, we
 // can eliminate extract_slice op and use the original tensor directly.
-struct CononicalizeExtractSliceAndConcat
+struct CanonicalizeExtractSliceAndConcat
     : public mlir::OpRewritePattern<amdgpu::ExtractSliceOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -237,7 +237,7 @@ struct CononicalizeExtractSliceAndConcat
 
 void ExtractSliceOp::getCanonicalizationPatterns(
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
-  patterns.add<CononicalizeExtractSliceAndConcat>(context);
+  patterns.add<CanonicalizeExtractSliceAndConcat>(context);
 }
 
 LogicalResult UpcastMXFPOp::verify() {
@@ -620,6 +620,17 @@ LogicalResult ConcatOp::verify() {
   return success();
 }
 
+LogicalResult BufferLoadToLocalOp::verify() {
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  if (!mod)
+    return success();
+
+  auto arch = mlir::getAMDArch(mod);
+  if (!arch || AMD::TargetInfo(arch->str()).supportsBufferLoadToLocal())
+    return success();
+  return emitError() << "BufferLoadToLocal unsupported on target architecture";
+}
+
 LogicalResult LocalLoadPackedTransposedOp::verify() {
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
@@ -711,7 +722,26 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
 
   auto paddedEnc =
       llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
-  if (!paddedEnc && !swizzledEnc)
+
+  // Check for PartitionedSharedEncodingAttr and validate its inner layout
+  auto partitionedEnc =
+      llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(smemTy.getEncoding());
+  if (partitionedEnc) {
+    auto partitionLayout = partitionedEnc.getPartitionLayout();
+    auto innerSwizzled =
+        llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(partitionLayout);
+    if (innerSwizzled && innerSwizzled.getMaxPhase() != 1)
+      return emitOpError(
+          "TDM does not support swizzling in partitioned layout");
+
+    auto innerPadded =
+        llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(partitionLayout);
+    if (!innerPadded && !innerSwizzled)
+      return emitOpError(
+          "Invalid inner layout for partitioned shared memory in TDM");
+  }
+
+  if (!paddedEnc && !swizzledEnc && !partitionedEnc)
     return emitOpError("Invalid shared memory layout for TDM");
 
   Type elementType = smemTy.getElementType();
@@ -760,8 +790,108 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
 
   auto paddedEnc =
       llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+  if (paddedEnc) {
+    // Check if we can apply the padding workaround, see the lowering to LLVM
+    // for more details.
+    auto intervals = paddedEnc.getIntervals();
+    if (intervals.size() != 1)
+      return emitOpError("TDM store only supports single interval paddings.");
+
+    if (intervals[0] != blockShape.back())
+      return emitOpError("TDM store padding is only supported when padding "
+                         "interval equals the innermost block dimension (got "
+                         "padInterval=")
+             << intervals[0] << ", innermost dimension=" << blockShape.back()
+             << ")";
+  }
+
+  if (!paddedEnc && !swizzledEnc)
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  return success();
+}
+
+LogicalResult AsyncTDMScatterOp::verify() {
+  auto tensorDescTy = getDesc().getType();
+  auto smemTy = getSrc().getType();
+
+  // TDM scatter mode only supports 2D tensors
+  auto blockShape = tensorDescTy.getBlockType().getShape();
+  if (blockShape.size() != 2)
+    return emitOpError("TDM scatter only supports 2D tensors, got ")
+           << blockShape.size() << "D";
+
+  // Check that every dimension of the block shape is <= 2^16
+  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
+  if (failed(verifyResult))
+    return verifyResult;
+
+  auto dstRowIndicesType = cast<RankedTensorType>(getDstRowIndices().getType());
+  if (dstRowIndicesType.getRank() != 1)
+    return emitOpError("dst_row_indices must be a 1D tensor");
+
+  // Element type (i16 or i32) is already verified by ODS constraint
+  // TensorOf<[I16, I32]>
+
+  int64_t numIndices = dstRowIndicesType.getShape()[0];
+  if (!llvm::isPowerOf2_64(numIndices))
+    return emitOpError("dst_row_indices size must be a power of 2, got ")
+           << numIndices;
+
+  auto swizzledEnc =
+      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
+    return emitOpError("TDM does not support swizzling");
+
+  auto paddedEnc =
+      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
   if (paddedEnc)
-    return emitOpError("TDM store does not support padding");
+    return emitOpError("TDM scatter does not support padding");
+
+  if (!paddedEnc && !swizzledEnc)
+    return emitOpError("Invalid shared memory layout for TDM");
+
+  return success();
+}
+
+LogicalResult AsyncTDMGatherOp::verify() {
+  auto tensorDescTy = getDesc().getType();
+  auto smemTy = getDst().getType();
+
+  // TDM gather mode only supports 2D tensors
+  auto blockShape = tensorDescTy.getBlockType().getShape();
+  if (blockShape.size() != 2)
+    return emitOpError("TDM gather only supports 2D tensors, got ")
+           << blockShape.size() << "D";
+
+  // Check that every dimension of the block shape is <= 2^16
+  auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
+  if (failed(verifyResult))
+    return verifyResult;
+
+  auto srcRowIndicesType = cast<RankedTensorType>(getSrcRowIndices().getType());
+  if (srcRowIndicesType.getRank() != 1)
+    return emitOpError("src_row_indices must be a 1D tensor");
+
+  // Element type (i16 or i32) is already verified by ODS constraint
+  // TensorOf<[I16, I32]>
+
+  int64_t numIndices = srcRowIndicesType.getShape()[0];
+  if (!llvm::isPowerOf2_64(numIndices))
+    return emitOpError("src_row_indices size must be a power of 2, got ")
+           << numIndices;
+
+  auto swizzledEnc =
+      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
+    return emitOpError("TDM does not support swizzling");
+
+  auto paddedEnc =
+      llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
+  if (paddedEnc && !(paddedEnc.getIntervals().size() == 1 &&
+                     paddedEnc.getPaddings().size() == 1))
+    return emitOpError(
+        "TDM gather does not support multiple interval-padding pairs");
 
   if (!paddedEnc && !swizzledEnc)
     return emitOpError("Invalid shared memory layout for TDM");

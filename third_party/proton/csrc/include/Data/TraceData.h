@@ -16,18 +16,12 @@ public:
 
   std::vector<uint8_t> toMsgPack(size_t phase) const override;
 
-  DataEntry addOp(const std::string &name) override;
-
   DataEntry addOp(size_t phase, size_t eventId,
                   const std::vector<Context> &contexts) override;
 
-  void addScopeMetrics(
-      size_t scopeId,
-      const std::map<std::string, MetricValueType> &metrics) override;
-
-  void addEntryMetrics(
-      size_t phase, size_t entryId,
-      const std::map<std::string, MetricValueType> &metrics) override;
+  void
+  addMetrics(size_t scopeId,
+             const std::map<std::string, MetricValueType> &metrics) override;
 
   class Trace;
 

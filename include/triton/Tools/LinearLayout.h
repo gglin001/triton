@@ -433,8 +433,8 @@ public:
   }
 
   // Remove a dimension of size 1 from the layout.
-  [[nodiscard]] LinearLayout unsqueezeIn(StringAttr dim) const;
-  [[nodiscard]] LinearLayout unsqueezeOut(StringAttr dim) const;
+  [[nodiscard]] LinearLayout squeezeIns(StringAttr dim) const;
+  [[nodiscard]] LinearLayout squeezeOuts(StringAttr dim) const;
 
   const BasesT &getBases() const { return bases; }
 
@@ -594,9 +594,6 @@ public:
   [[nodiscard]] LinearLayout concatIns(const LinearLayout &other) const;
   [[nodiscard]] LinearLayout concatOuts(const LinearLayout &other) const;
 
-  // Remove all the bases that equal to 0 for the given input dimension.
-  [[nodiscard]] LinearLayout unsqueezeIns(StringAttr dim) const;
-
   // Computes the direct sum of two layouts.
   // https://en.wikipedia.org/wiki/Direct_sum#Direct_sum_of_matrices
   //
@@ -627,11 +624,11 @@ public:
   //
   //    - identity1D(4, "i", "o") * zeros1D(2, "i", "o") => L(x) = x % 4
   //      for x in [0,8).
-  //      The output matrix is [[1, 0, 0], [0, 1, 0], [0, 0, 0]]
+  //      The output matrix is [[1, 0, 0], [0, 1, 0]]
   //
   //    - zeros1D(2, "i", "o") * identity1D(4, "i", "o") => L(x) = x / 2
   //      for x in [0,8).
-  //      The output matrix is [[0, 0, 0], [0, 1, 0], [0, 0, 1]]
+  //      The output matrix is [[0, 1, 0], [0, 0, 1]]
 
   //    - identity1D(4, "i", "o1") * identity1D(8, "i", "o2") =>
   //      L(x) = (x % 4, x / 4) for x in [0,32).

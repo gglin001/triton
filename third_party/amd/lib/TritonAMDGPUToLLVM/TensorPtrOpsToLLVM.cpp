@@ -1,3 +1,4 @@
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TDMUtility.h"
 #include "Utility.h"
@@ -11,6 +12,64 @@ using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
 namespace {
+// Collects all users of the value beyond the basic block boundaries
+// defining a given value.
+void collectUsers(Value value, llvm::SetVector<Operation *> &users) {
+  for (OpOperand &use : value.getUses()) {
+    Operation *userOp = use.getOwner();
+    if (users.contains(userOp)) {
+      // stop recursion; avoid loops
+      return;
+    }
+    users.insert(userOp);
+    const unsigned argIdx = use.getOperandNumber();
+
+    if (auto unrealCast = dyn_cast<mlir::UnrealizedConversionCastOp>(userOp)) {
+      collectUsers(unrealCast->getResult(argIdx), users);
+    }
+
+    if (auto branch = dyn_cast<mlir::BranchOpInterface>(userOp)) {
+      auto successors = branch->getSuccessors();
+      for (auto [idx, successor] : llvm::enumerate(successors)) {
+        auto operands = branch.getSuccessorOperands(idx);
+        if (argIdx < operands.size()) {
+          collectUsers(successor->getArgument(argIdx), users);
+        }
+      }
+    }
+  }
+}
+
+Attribute findEncodingFromUsers(Operation *op) {
+  llvm::SetVector<Operation *> users;
+  for (auto result : op->getResults())
+    collectUsers(result, users);
+
+  Attribute sharedEnc;
+  for (auto use : users) {
+    Attribute userEnc;
+    if (auto load = llvm::dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(use)) {
+      userEnc = load.getResult().getType().getEncoding();
+    } else if (auto store =
+                   llvm::dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(use)) {
+      userEnc = store.getSrc().getType().getEncoding();
+    }
+    if (!userEnc)
+      continue;
+
+    // Assign first encoding found; or error out if different encoding is found
+    if (!sharedEnc)
+      sharedEnc = userEnc;
+    else if (sharedEnc != userEnc) {
+      op->emitError("Descriptor is used with different shared encodings.");
+      return {};
+    }
+  }
+  if (!sharedEnc)
+    op->emitError("Encoding hasn't been found from users.");
+  return sharedEnc;
+}
+
 struct MakeTensorDescOpConversion
     : public ConvertOpToLLVMPattern<triton::MakeTensorDescOp> {
   using ConvertOpToLLVMPattern<
@@ -29,19 +88,19 @@ struct MakeTensorDescOpConversion
     auto blockTy = tensorDescTy.getBlockType();
     auto sharedEnc = blockTy.getEncoding();
     if (!sharedEnc) {
-      return rewriter.notifyMatchFailure(op, "Descriptor has no layout.");
+      // TODO: add an extra pass to assign layout to descriptors
+      sharedEnc = findEncodingFromUsers(op);
+      if (!sharedEnc)
+        return rewriter.notifyMatchFailure(op, "Descriptor has no layout.");
     }
-    auto paddedEnc = llvm::dyn_cast<PaddedSharedEncodingAttr>(sharedEnc);
-
     unsigned padInterval = 0;
     unsigned padAmount = 0;
-    if (paddedEnc) {
-      if (paddedEnc.getIntervals().size() != 1 ||
-          paddedEnc.getPaddings().size() != 1)
+    if (auto padEnc = getPaddedEncoding(sharedEnc)) {
+      if (padEnc.getIntervals().size() != 1 || padEnc.getPaddings().size() != 1)
         return rewriter.notifyMatchFailure(
             op, "NYI: Multiple interval-padding pairs in TDM.");
-      padInterval = paddedEnc.getIntervals()[0];
-      padAmount = paddedEnc.getPaddings()[0];
+      padInterval = padEnc.getIntervals()[0];
+      padAmount = padEnc.getPaddings()[0];
     }
 
     Type elementType =

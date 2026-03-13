@@ -117,7 +117,8 @@ proton.start(name="profile_name", context="shadow", backend="cupti", mode="pcsam
 #### Instrumentation
 
 The instrumentation backend allows for detailed, fine-grained profiling of intra-kernel behavior, generating trace or tree views similar to those produced by coarse-grained profiling.
-By default, if no `mode` is specified, Proton profiles kernel cycles, which may require shared memory or global memory (depends on `buffer-type`). If there is insufficient profiling memory capacity, profiling will abort and a warning will be displayed. Future releases will introduce additional instrumentation modes. See the [tutorial](tutorials/intra_kernel) for more detailed information and examples.
+By default, if no `mode` is specified, Proton profiles kernel cycles, which may require shared memory or global memory (depends on `buffer-type`). If there is insufficient profiling memory capacity, profiling will abort and a warning will be displayed. Future releases will introduce additional instrumentation modes. See the [tutorial](tutorials/intra_kernel) for more detailed information and examples. A video demo of the Tutorials from the 2025 Triton conference can be found here:
+https://youtu.be/PGUw2P55ZYM?si=EgsYeGzb9suBZSX5&t=984
 
 **Host-side usage:**
 
@@ -166,7 +167,7 @@ def kernel(...):
             gl.load(...)
 ```
 
-Advanced users can instrument either the `ttir` or `ttgir` intermediate representations for even finer-grained measurement. The relevant IR instructions are `proton.record start` and `proton.record end`. This can be combined with the environment variable `TRITON_KERNEL_OVERRIDE=1` for custom kernel overrides. For detailed steps, refer to the Triton [documentation](https://github.com/triton-lang/triton?tab=readme-ov-file#tips-for-hacking) under the **Kernel Override Steps** section. We have also assembled a [tutorial](tutorials/intra_kernel) that demonstrates how to use the IR-based instrumentation approach and the proton DSL approach.
+Advanced users can instrument either the `ttir` or `ttgir` intermediate representations for even finer-grained measurement. The relevant IR instructions are `proton.record start` and `proton.record end`. This can be combined with the environment variable `TRITON_KERNEL_OVERRIDE=1` for custom kernel overrides. For detailed steps, refer to the Triton [documentation](https://github.com/triton-lang/triton?tab=readme-ov-file#tips-for-hacking) under the **Kernel Override Steps** section. We have also assembled a [tutorial](tutorials/intra_kernel) that demonstrates how to use the IR-based instrumentation approach and the proton DSL approach. Video demo of the IR-based instrumentation approach can be found here:https://youtu.be/PGUw2P55ZYM?si=mBaHPud74EPAa7xt&t=1074
 
 ### Hook
 
@@ -409,10 +410,16 @@ import triton.profiler as proton
 session_id = proton.start(name="profile_name")
 ...
 
-# get_data_* APIs do not synchronize the device, so make sure all kernels are finished before calling them
-proton.deactivate(session_id, flushing=True) # with flushing=False, it's not guaranteed that all kernels are finished but it's faster
+# data.get_* APIs do not synchronize the device, so make sure all kernels are finished before calling them
+# Usage 1: flush the profile data from the device eagerly and access all data
+proton.deactivate(session_id, flushing=True) # with flushing=False, it's not guaranteed that all kernels are finished
 # Get a json dictionary
 data = proton.data.get_json(session_id)
 # Get a msgpack bytes
 data_msgpack = proton.data.get_msgpack(session_id)
+
+# Usage 2: query the phase completion status and access data in the completed phases
+if proton.data.is_phase_complete(session_id, phase_id):
+    data_phase = proton.data.get_json(session_id, phase_id)
+    proton.data.clear(session_id, phase_id)
 ```
