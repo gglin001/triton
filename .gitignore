@@ -9,7 +9,6 @@ llvm-triton
 # pixi environments
 .pixi/*
 !.pixi/config.toml
-pixi.lock
 
 # Triton builds
 build/
