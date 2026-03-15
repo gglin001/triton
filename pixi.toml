@@ -77,6 +77,8 @@ cu130 = { features = ["cu130"], no-default-feature = true }
 PATH = "${PIXI_PROJECT_ROOT}/build/bin:${PIXI_PROJECT_ROOT}/llvm-triton/llvm-project/build/bin:${PATH}"
 # only needed on macos
 # CMAKE_PREFIX_PATH = "${CONDA_PREFIX}"
+CONDA_OVERRIDE_CUDA = "12.9"
+# CONDA_OVERRIDE_CUDA="13.0"
 
 [target.osx-arm64.activation.env]
 # lld is installed globaly, always prefer lld on osx
